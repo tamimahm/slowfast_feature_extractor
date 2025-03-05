@@ -46,16 +46,16 @@ class VideoSet(torch.utils.data.Dataset):
         self.vid_id = vid_id
         self.read_vid_file = read_vid_file
 
-        self.in_fps = cfg.DATA.IN_FPS
-        self.out_fps = cfg.DATA.OUT_FPS
+        self.in_fps = 10 #cfg.DATA.IN_FPS
+        self.out_fps = 10#cfg.DATA.OUT_FPS
         self.step_size = int(self.in_fps / self.out_fps)
 
         self.out_size = cfg.DATA.NUM_FRAMES
 
-        if isinstance(cfg.DATA.SAMPLE_SIZE, list):
-            self.sample_width, self.sample_height = cfg.DATA.SAMPLE_SIZE
-        elif isinstance(cfg.DATA.SAMPLE_SIZE, int):
-            self.sample_width = self.sample_height = cfg.DATA.SAMPLE_SIZE
+        if isinstance([256, 256], list):#cfg.DATA.SAMPLE_SIZE
+            self.sample_width, self.sample_height = [256, 256]#cfg.DATA.SAMPLE_SIZE
+        elif isinstance([256, 256], int):#cfg.DATA.SAMPLE_SIZE
+            self.sample_width = self.sample_height = [256, 256]#cfg.DATA.SAMPLE_SIZE
         else:
             raise Exception(
                 "Error: Frame sampling size type must be a list [Height, Width] or int"
@@ -71,7 +71,7 @@ class VideoSet(torch.utils.data.Dataset):
         """
         if self.read_vid_file:
             path_to_vid = (
-                os.path.join(self.vid_path, self.vid_id) + self.cfg.DATA.VID_FILE_EXT
+                os.path.join(self.vid_path, self.vid_id.split(',')[0]) 
             )
             assert os.path.exists(path_to_vid), "{} file not found".format(path_to_vid)
 
@@ -87,7 +87,7 @@ class VideoSet(torch.utils.data.Dataset):
 
             frames = None
 
-            for in_frame in video_clip.iter_frames(fps=self.cfg.DATA.IN_FPS):
+            for in_frame in video_clip.iter_frames(fps=10):#self.cfg.DATA.IN_FPS
                 in_frame = cv2.resize(
                     in_frame,
                     (self.sample_width, self.sample_height),
@@ -106,10 +106,10 @@ class VideoSet(torch.utils.data.Dataset):
             path_to_frames = os.path.join(self.vid_path, self.vid_id)
             frames = sorted(
                 filter(
-                    lambda x: x.endswith(self.cfg.DATA.IMG_FILE_EXT),
+                    lambda x: x.endswith('.mp4'),#self.cfg.DATA.IMG_FILE_EXT
                     os.listdir(path_to_frames),
                 ),
-                key=lambda x: parse(self.cfg.DATA.IMG_FILE_FORMAT, x)[0],
+                key=lambda x: parse('.jpg', x)[0],#self.cfg.DATA.IMG_FILE_FORMAT
             )
             return frames
 
