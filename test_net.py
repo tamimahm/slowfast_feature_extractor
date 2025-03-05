@@ -106,8 +106,8 @@ def test(cfg):
     print("Done")
     print("----------------------------------------------------------")
 
-    if cfg.DATA.READ_VID_FILE:
-        rejected_vids = []
+    #if cfg.DATA.READ_VID_FILE:
+    rejected_vids = []
 
     print("{} videos to be processed...".format(len(videos)))
     print("----------------------------------------------------------")
@@ -118,18 +118,18 @@ def test(cfg):
         path_to_vid = os.path.join(vid_root, os.path.split(vid)[0])
         vid_id = os.path.split(vid)[1]
 
-        if cfg.DATA.READ_VID_FILE:
-            try:
-                _ = VideoFileClip(
-                    os.path.join(path_to_vid, vid_id) + cfg.DATA.VID_FILE_EXT,
-                    audio=False,
-                    fps_source="fps",
-                )
-            except Exception as e:
-                print("{}. {} cannot be read with error {}".format(vid_no, vid, e))
-                print("----------------------------------------------------------")
-                rejected_vids.append(vid)
-                continue
+        #if cfg.DATA.READ_VID_FILE:
+        try:
+            _ = VideoFileClip(
+                os.path.join(path_to_vid, vid_id.split(',')[0]) ,
+                audio=False,
+                fps_source="fps",
+            )
+        except Exception as e:
+            print("{}. {} cannot be read with error {}".format(vid_no, vid, e))
+            print("----------------------------------------------------------")
+            rejected_vids.append(vid)
+            continue
 
         out_path = os.path.join(cfg.OUTPUT_DIR, os.path.split(vid)[0])
         out_file = vid_id.split(".")[0] + "_{}.npy".format(cfg.DATA.NUM_FRAMES)
@@ -141,7 +141,7 @@ def test(cfg):
         print("{}. Processing {}...".format(vid_no, vid))
 
         dataset = VideoSet(
-            cfg, path_to_vid, vid_id, read_vid_file=cfg.DATA.READ_VID_FILE
+            cfg, path_to_vid, vid_id, read_vid_file=True
         )
         test_loader = torch.utils.data.DataLoader(
             dataset,
