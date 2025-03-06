@@ -46,8 +46,8 @@ class VideoSet(torch.utils.data.Dataset):
         self.vid_id = vid_id
         self.read_vid_file = read_vid_file
 
-        self.in_fps = 10 #cfg.DATA.IN_FPS
-        self.out_fps = 10#cfg.DATA.OUT_FPS
+        self.in_fps = 3 #cfg.DATA.IN_FPS
+        self.out_fps = 3#cfg.DATA.OUT_FPS
         self.step_size = int(self.in_fps / self.out_fps)
 
         self.out_size = cfg.DATA.NUM_FRAMES
@@ -87,7 +87,7 @@ class VideoSet(torch.utils.data.Dataset):
 
             frames = None
 
-            for in_frame in video_clip.iter_frames(fps=10):#self.cfg.DATA.IN_FPS
+            for in_frame in video_clip.iter_frames(fps=3):#self.cfg.DATA.IN_FPS
                 in_frame = cv2.resize(
                     in_frame,
                     (self.sample_width, self.sample_height),
