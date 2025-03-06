@@ -1,6 +1,6 @@
 import sys
 from run_net import main
-
+from multiprocessing import freeze_support
 # Simulate command-line arguments
 sys.argv = [
     "run_net.py",  # Script name (required by argparse)
@@ -8,5 +8,7 @@ sys.argv = [
     # Add other arguments if needed, e.g., --init_method, etc.
 ]
 
+if __name__ == "__main__":
 # Call the main function
-main()
+    freeze_support()
+    main()
