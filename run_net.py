@@ -1,26 +1,16 @@
-#!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+import sys
+#from test_net import main  # Updated to import from test_net.py
+#from faster_rcnn_slowFast import main  # Updated to import from test_net.py
+from faster_rcnn_slowfast_finetune import main
 
-"""Wrapper to train and test a video classification model."""
-from slowfast.utils.misc import launch_job
-from slowfast.utils.parser import parse_args
-from slowfast.config.defaults import get_cfg  # Import get_cfg directly
+from multiprocessing import freeze_support
 
-from test_net import test
-
-
-def main():
-    """
-    Main function to spawn the train and test process.
-    """
-    args = parse_args()
-    cfg = get_cfg()  # Use get_cfg directly
-    cfg.merge_from_file(args.cfg_files[0])  # Load the config file
-
-    # Perform multi-clip testing.
-    if cfg.TEST.ENABLE:
-        launch_job(cfg=cfg, init_method=args.init_method, func=test)
-
+# Simulate command-line arguments
+sys.argv = [
+    "run_net.py",  # Script name (required by argparse)
+    "--cfg", "D:/Github/slowfast_feature_extractor/configs/SLOWFAST_8x8_R50.yaml",  # Path to your config file
+]
 
 if __name__ == "__main__":
+    freeze_support()
     main()
