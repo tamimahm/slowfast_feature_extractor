@@ -30,55 +30,40 @@ from models import build_model
 
 logger = logging.get_logger(__name__)
 
-# Function to load bounding boxes
+
 def load_bboxes(bbox_dir, video_id):
     """
     Load bounding box data for a video segment.
-    Args:
-        bbox_dir (str): Directory containing bounding box files.
-        video_id (str): Video identifier (e.g., 'patient_1_task_1_cam3_seg_0').
-    Returns:
-        list: List of bounding boxes, each an array of shape (4,) [x_min, y_min, x_max, y_max].
-              Returns None if file not found or data is invalid.
     """
     bbox_file = os.path.join(bbox_dir, f"{video_id}_bboxes.pkl")
     if not os.path.exists(bbox_file):
         logger.warning(f"No bounding box file found for {video_id} at {bbox_file}")
         return None
-    
+
     try:
         with open(bbox_file, 'rb') as f:
             bboxes = pickle.load(f)
     except Exception as e:
         logger.error(f"Error loading bounding box file for {video_id}: {e}")
         return None
-    
+
     if not isinstance(bboxes, list) or not bboxes:
         logger.error(f"Invalid bounding box data for {video_id}: expected a non-empty list, got {type(bboxes)}")
         return None
-    
+
     for i, box in enumerate(bboxes):
         if not isinstance(box, (list, np.ndarray)) or len(box) != 4:
             logger.error(f"Invalid bounding box at frame {i} for {video_id}: expected 4 values, got {box}")
             return None
-    
+
     return bboxes
 
-# Custom Dataset for a Single Video Segment with Cropped Frames
+
 class SinglePickleFrameDataset(torch.utils.data.Dataset):
     def __init__(self, frames, video_id, label, cfg, bbox_dir):
-        """
-        Initialize dataset for a single video segment.
-        Args:
-            frames (list): List of video frames.
-            video_id (str): Unique identifier for the video segment.
-            label (int): Label for the segment (0 or 1).
-            cfg: SlowFast configuration object.
-            bbox_dir (str): Directory containing bounding box files.
-        """
         self.frames = frames
         self.video_id = video_id
-        self.label = label  # Label for training (0 or 1)
+        self.label = label
         self.cfg = cfg
         self.bbox_dir = bbox_dir
         self.bboxes = load_bboxes(bbox_dir, video_id)
@@ -87,134 +72,112 @@ class SinglePickleFrameDataset(torch.utils.data.Dataset):
             transforms.Resize((256, 256)),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225])
+            transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225]),
         ])
 
     def __len__(self):
         return 1
 
     def __getitem__(self, idx):
-        num_frames_fast = self.cfg.DATA.NUM_FRAMES  # e.g., 8
-        alpha = self.cfg.SLOWFAST.ALPHA  # e.g., 4
-        num_frames_slow = num_frames_fast // alpha  # e.g., 2
-        logger.debug(f"Video {self.video_id} - num_frames_fast: {num_frames_fast}, num_frames_slow: {num_frames_slow}")
+        num_frames_fast = self.cfg.DATA.NUM_FRAMES
+        alpha = self.cfg.SLOWFAST.ALPHA
+        num_frames_slow = num_frames_fast // alpha
 
-        # Sample indices for fast pathway
+        # Sample indices
         if len(self.frames) < num_frames_fast:
-            fast_indices = list(range(len(self.frames))) + [len(self.frames) - 1] * (num_frames_fast - len(self.frames))
+            fast_indices = list(range(len(self.frames))) + [len(self.frames)-1] * (num_frames_fast - len(self.frames))
         else:
-            step = max(1, len(self.frames) // num_frames_fast)
+            step = max(1, len(self.frames)//num_frames_fast)
             fast_indices = [i for i in range(0, len(self.frames), step)][:num_frames_fast]
 
-        # Sample indices for slow pathway
         if len(self.frames) < num_frames_slow:
-            slow_indices = list(range(len(self.frames))) + [len(self.frames) - 1] * (num_frames_slow - len(self.frames))
+            slow_indices = list(range(len(self.frames))) + [len(self.frames)-1] * (num_frames_slow - len(self.frames))
         else:
-            step = max(1, len(self.frames) // num_frames_slow)
+            step = max(1, len(self.frames)//num_frames_slow)
             slow_indices = [i for i in range(0, len(self.frames), step)][:num_frames_slow]
 
         def crop_frame(frame, bbox):
-            """Crop frame using bounding box with 30-pixel extension on the lower side."""
             if bbox is None or len(bbox) != 4:
-                logger.warning(f"No valid bbox for frame in {self.video_id}, using full frame")
                 return frame
             x_min, y_min, x_max, y_max = map(int, bbox)
             h, w = frame.shape[:2]
-            y_max_extended = y_max + 30  # Extend lower side by 30 pixels
+            y_max_ext = min(h, y_max + 30)
             x_min, x_max = max(0, x_min), min(w, x_max)
-            y_min, y_max_extended = max(0, y_min), min(h, y_max_extended)
-            if x_max <= x_min or y_max_extended <= y_min:
-                logger.warning(f"Invalid crop coordinates [{x_min}, {y_min}, {x_max}, {y_max_extended}] for {self.video_id}, using full frame")
+            if x_max <= x_min or y_max_ext <= y_min:
                 return frame
-            return frame[y_min:y_max_extended, x_min:x_max]
+            return frame[y_min:y_max_ext, x_min:x_max]
 
-        fast_processed = []
-        fast_original = []
-        slow_processed = []
-        slow_original = []
+        fast_processed, fast_original = [], []
+        slow_processed, slow_original = [], []
 
-        # Process frames for fast pathway
+        # Fast
         for i in fast_indices:
             frame = self.frames[i]
             if isinstance(frame, torch.Tensor):
-                frame = frame.permute(1, 2, 0).numpy()
-            elif isinstance(frame, np.ndarray) and frame.ndim == 4 and frame.shape[0] == 1:
+                frame = frame.permute(1,2,0).numpy()
+            elif isinstance(frame, np.ndarray) and frame.ndim == 4 and frame.shape[0]==1:
                 frame = frame.squeeze(0)
-
             if frame.dtype != np.uint8:
-                frame = (frame * 255).astype(np.uint8) if frame.max() <= 1.0 else frame.astype(np.uint8)
+                frame = (frame*255).astype(np.uint8) if frame.max()<=1.0 else frame.astype(np.uint8)
+            if frame.ndim!=3 or frame.shape[2]!=3:
+                frame = np.zeros((224,224,3),dtype=np.uint8)
+            bbox = (self.bboxes[i] if self.bboxes and i<len(self.bboxes) else None)
+            cropped = crop_frame(frame, bbox)
+            fast_original.append(cropped)
+            fast_processed.append(self.transform(Image.fromarray(cropped)))
 
-            if frame.ndim != 3 or frame.shape[2] != 3:
-                logger.warning(f"Invalid frame dimensions {frame.shape} for {self.video_id}, using dummy")
-                frame = np.zeros((224, 224, 3), dtype=np.uint8)
-
-            bbox = self.bboxes[i] if self.bboxes and i < len(self.bboxes) else None
-            cropped_frame = crop_frame(frame, bbox)
-            pil_img = Image.fromarray(cropped_frame)
-            fast_processed.append(self.transform(pil_img))
-            fast_original.append(cropped_frame)
-
-        # Process frames for slow pathway
+        # Slow
         for i in slow_indices:
             frame = self.frames[i]
             if isinstance(frame, torch.Tensor):
-                frame = frame.permute(1, 2, 0).numpy()
-            elif isinstance(frame, np.ndarray) and frame.ndim == 4 and frame.shape[0] == 1:
+                frame = frame.permute(1,2,0).numpy()
+            elif isinstance(frame, np.ndarray) and frame.ndim == 4 and frame.shape[0]==1:
                 frame = frame.squeeze(0)
-
             if frame.dtype != np.uint8:
-                frame = (frame * 255).astype(np.uint8) if frame.max() <= 1.0 else frame.astype(np.uint8)
-
-            if frame.ndim != 3 or frame.shape[2] != 3:
-                logger.warning(f"Invalid frame dimensions {frame.shape} for {self.video_id}, using dummy")
-                frame = np.zeros((224, 224, 3), dtype=np.uint8)
-
-            bbox = self.bboxes[i] if self.bboxes and i < len(self.bboxes) else None
-            cropped_frame = crop_frame(frame, bbox)
-            pil_img = Image.fromarray(cropped_frame)
-            slow_processed.append(self.transform(pil_img))
-            slow_original.append(cropped_frame)
+                frame = (frame*255).astype(np.uint8) if frame.max()<=1.0 else frame.astype(np.uint8)
+            if frame.ndim!=3 or frame.shape[2]!=3:
+                frame = np.zeros((224,224,3),dtype=np.uint8)
+            bbox = (self.bboxes[i] if self.bboxes and i<len(self.bboxes) else None)
+            cropped = crop_frame(frame, bbox)
+            slow_original.append(cropped)
+            slow_processed.append(self.transform(Image.fromarray(cropped)))
 
         # Stack tensors
-        if not fast_processed or not slow_processed:
-            logger.warning(f"No valid frames for {self.video_id}, using dummy tensors")
-            fast_tensor = torch.zeros((3, num_frames_fast, 224, 224))
-            slow_tensor = torch.zeros((3, num_frames_slow, 224, 224))
-            fast_original = [np.zeros((224, 224, 3), dtype=np.uint8)] * num_frames_fast
-            slow_original = [np.zeros((224, 224, 3), dtype=np.uint8)] * num_frames_slow
+        if fast_processed and slow_processed:
+            fast_tensor = torch.stack(fast_processed, dim=0).permute(1,0,2,3)
+            slow_tensor = torch.stack(slow_processed, dim=0).permute(1,0,2,3)
         else:
-            fast_tensor = torch.stack(fast_processed, dim=0).permute(1, 0, 2, 3)
-            slow_tensor = torch.stack(slow_processed, dim=0).permute(1, 0, 2, 3)
-            if fast_tensor.shape[1] < num_frames_fast:
-                fast_tensor = torch.cat([fast_tensor, fast_tensor[:, -1:].repeat(1, num_frames_fast - fast_tensor.shape[1], 1, 1)], dim=1)
-                fast_original.extend([fast_original[-1]] * (num_frames_fast - len(fast_original)))
-            if slow_tensor.shape[1] < num_frames_slow:
-                slow_tensor = torch.cat([slow_tensor, slow_tensor[:, -1:].repeat(1, num_frames_slow - slow_tensor.shape[1], 1, 1)], dim=1)
-                slow_original.extend([slow_original[-1]] * (num_frames_slow - len(slow_original)))
-            fast_tensor = fast_tensor[:, :num_frames_fast]
-            slow_tensor = slow_tensor[:, :num_frames_slow]
-            fast_original = fast_original[:num_frames_fast]
-            slow_original = slow_original[:num_frames_slow]
+            fast_tensor = torch.zeros((3, num_frames_fast, 224,224))
+            slow_tensor = torch.zeros((3, num_frames_slow,224,224))
+            fast_original = [np.zeros((224,224,3),dtype=np.uint8)]*num_frames_fast
+            slow_original = [np.zeros((224,224,3),dtype=np.uint8)]*num_frames_slow
 
-        logger.debug(f"Video {self.video_id} - fast_tensor shape: {fast_tensor.shape}, slow_tensor shape: {slow_tensor.shape}")
-        video_tensor = [slow_tensor, fast_tensor]
-        return video_tensor, self.video_id, slow_original, fast_original, torch.tensor(self.label, dtype=torch.long)
+        return [slow_tensor, fast_tensor], self.video_id, slow_original, fast_original, torch.tensor(self.label, dtype=torch.long)
 
-# Function to modify the SlowFast head
+
+def fastslow_collate_fn(batch):
+    """
+    Custom collate_fn: stacks only the Slow/Fast tensors & labels.
+    Leaves video_ids and raw-frames as Python lists.
+    """
+    slow_batch = torch.stack([item[0][0] for item in batch], dim=0)
+    fast_batch = torch.stack([item[0][1] for item in batch], dim=0)
+    inputs = [slow_batch, fast_batch]
+
+    video_ids     = [item[1] for item in batch]
+    slow_raw      = [item[2] for item in batch]
+    fast_raw      = [item[3] for item in batch]
+    labels        = torch.stack([item[4] for item in batch], dim=0)
+
+    return inputs, video_ids, slow_raw, fast_raw, labels
+
+
 def modify_slowfast_head(model, num_classes, device):
-    """
-    Modify the SlowFast model's head to match the number of classes.
-    Args:
-        model: SlowFast model.
-        num_classes (int): Number of classes for the new task.
-        device: Device to place the new layer on (e.g., 'cuda:0' or 'cpu').
-    Returns:
-        model: Modified SlowFast model.
-    """
-    in_features = model.head.projection.in_features  # e.g., 2304 for SlowFast R50
+    in_features = model.head.projection.in_features
     model.head.projection = torch.nn.Linear(in_features, num_classes).to(device)
-    logger.info(f"Modified SlowFast head to output {num_classes} classes on device {device}")
+    logger.info(f"Modified SlowFast head to {num_classes} classes on {device}")
     return model
+
 
 # Grad-CAM implementation for SlowFast
 class GradCAM:
@@ -415,65 +378,41 @@ def perform_inference(test_loader, model, cfg):
         del inputs, preds, feat
         torch.cuda.empty_cache()
 
-# Function to fine-tune the model
+
 def train(cfg, train_loader, val_loader, model):
-    """
-    Fine-tune the SlowFast model on the training set.
-    Args:
-        cfg: SlowFast configuration object.
-        train_loader: DataLoader for the training set.
-        val_loader: DataLoader for the validation set.
-        model: SlowFast model to fine-tune.
-    Returns:
-        model: Fine-tuned SlowFast model.
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    
-    # Modify the head for your task (2 classes: 0 and 1)
-    num_classes = 2
-    model = modify_slowfast_head(model, num_classes, device)
-    
-    # Freeze early layers (up to s3)
-    freeze_until = 's3'
+    model = modify_slowfast_head(model, num_classes=2, device=device)
+
+    # Freeze s1, s2, s3 layers
     for name, param in model.named_parameters():
-        if 's1' in name or 's2' in name or 's3' in name:
+        if any(s in name for s in ["s1", "s2", "s3"]):
             param.requires_grad = False
-        else:
-            param.requires_grad = True
-    logger.info(f"Froze layers up to {freeze_until}, trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    
-    # Define optimizer and loss
+
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
     criterion = torch.nn.CrossEntropyLoss()
-    
-    # Training loop
+
     num_epochs = 10
     for epoch in range(num_epochs):
         model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
-        
-        for inputs, video_id, slow_frames, fast_frames, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+        train_loss = train_correct = train_total = 0
+
+        for inputs, video_id, _, _, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             inputs = [inp.to(device) for inp in inputs]
             labels = labels.to(device)
-            
+
             optimizer.zero_grad()
             outputs, _ = model(inputs)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            
-            train_loss += loss.item()
-            _, predicted = torch.max(outputs, 1)
-            train_total += labels.size(0)
-            train_correct += (predicted == labels).sum().item()
-        
-        train_acc = 100 * train_correct / train_total
-        logger.info(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss/train_total:.4f}, Train Acc: {train_acc:.2f}%")
-        
-        # Validation
+
+            train_loss   += loss.item()
+            _, pred       = outputs.max(1)
+            train_total  += labels.size(0)
+            train_correct+= (pred == labels).sum().item()
+
+        logger.info(f"Epoch {epoch+1}: Train Loss {train_loss/train_total:.4f}, Acc {100*train_correct/train_total:.2f}%")
         model.eval()
         val_loss = 0.0
         val_correct = 0
@@ -493,13 +432,11 @@ def train(cfg, train_loader, val_loader, model):
         
         val_acc = 100 * val_correct / val_total
         logger.info(f"Epoch {epoch+1}/{num_epochs}, Val Loss: {val_loss/val_total:.4f}, Val Acc: {val_acc:.2f}%")
-    
-    # Save the fine-tuned model
+
     torch.save(model.state_dict(), os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned.pt"))
-    logger.info(f"Saved fine-tuned model to {os.path.join(cfg.OUTPUT_DIR, 'slowfast_finetuned.pt')}")
     return model
 
-# Main function to run fine-tuning and inference
+
 def test(cfg):
     """
     Main function to fine-tune the SlowFast model and perform inference.
@@ -530,7 +467,7 @@ def test(cfg):
     logger.info(f"Found {len(pickle_files)} pickle files to process.")
     logger.info("----------------------------------------------------------")
 
-    # Collect all segments
+    # Collect all_segments as before...
     all_segments = []
     for pkl_file in tqdm(pickle_files, desc="Collecting segments"):
         try:
@@ -563,66 +500,66 @@ def test(cfg):
                             'video_id': video_id,
                             'label': label
                         })
+    # Split
+    train_segments, val_segments = train_test_split(
+        all_segments, test_size=0.2, random_state=42
+    )
+    logger.info(f"Train/Val split: {len(train_segments)}/{len(val_segments)} segments")
 
-    # Split into train and validation (80-20 split)
-    train_segments, val_segments = train_test_split(all_segments, test_size=0.2, random_state=42)
-    logger.info(f"Dataset split: {len(train_segments)} training segments, {len(val_segments)} validation segments")
+    # ─── Create Datasets ────────────────────────────────────────────────────────
+    train_datasets = [
+        SinglePickleFrameDataset(
+            frames=seg["frames"],
+            video_id=seg["video_id"],
+            label=seg["label"],
+            cfg=cfg,
+            bbox_dir=bbox_dir,
+        )
+        for seg in train_segments
+    ]
+    val_datasets = [
+        SinglePickleFrameDataset(
+            frames=seg["frames"],
+            video_id=seg["video_id"],
+            label=seg["label"],
+            cfg=cfg,
+            bbox_dir=bbox_dir,
+        )
+        for seg in val_segments
+    ]
 
-    # Create datasets
-    train_datasets = [SinglePickleFrameDataset(
-        frames=seg['frames'],
-        video_id=seg['video_id'],
-        label=seg['label'],
-        cfg=cfg,
-        bbox_dir=bbox_dir
-    ) for seg in train_segments]
-    
-    val_datasets = [SinglePickleFrameDataset(
-        frames=seg['frames'],
-        video_id=seg['video_id'],
-        label=seg['label'],
-        cfg=cfg,
-        bbox_dir=bbox_dir
-    ) for seg in val_segments]
-
-    # Create data loaders
+    # ─── DataLoaders with custom collate_fn ─────────────────────────────────────
     train_loader = torch.utils.data.DataLoader(
         torch.utils.data.ConcatDataset(train_datasets),
-        batch_size=1,
+        batch_size=4,
         shuffle=True,
         num_workers=0,
         pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
-        drop_last=False
+        drop_last=False,
+        collate_fn=fastslow_collate_fn,
     )
-
     val_loader = torch.utils.data.DataLoader(
         torch.utils.data.ConcatDataset(val_datasets),
-        batch_size=1,
+        batch_size=4,
         shuffle=False,
         num_workers=0,
         pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
-        drop_last=False
+        drop_last=False,
+        collate_fn=fastslow_collate_fn,
     )
 
-    # Fine-tune the model
-    logger.info("Starting fine-tuning...")
+    # Fine‑tune & inference
     model = train(cfg, train_loader, val_loader, model)
-
-    # Perform inference on validation set to visualize Grad-CAM heatmaps
-    logger.info("Performing inference on validation set...")
     perform_inference(val_loader, model, cfg)
 
-    logger.info("----------------------------------------------------------")
 
 def main():
-    """
-    Entry point for the script.
-    """
     args = parse_args()
     cfg = get_cfg()
     cfg.merge_from_file(args.cfg_files[0])
     if cfg.TEST.ENABLE:
         launch_job(cfg=cfg, init_method=args.init_method, func=test)
+
 
 if __name__ == "__main__":
     main()
