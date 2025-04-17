@@ -14,6 +14,7 @@ import warnings
 import matplotlib.pyplot as plt
 import cv2
 from sklearn.model_selection import train_test_split
+from torch.cuda.amp import autocast, GradScaler
 
 # Suppress specific warnings from torchvision
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.transforms._transforms_video")
@@ -60,20 +61,32 @@ def load_bboxes(bbox_dir, video_id):
 
 
 class SinglePickleFrameDataset(torch.utils.data.Dataset):
-    def __init__(self, frames, video_id, label, cfg, bbox_dir):
+    def __init__(self, frames, video_id, label, cfg, bbox_dir, is_train=True):
         self.frames = frames
         self.video_id = video_id
         self.label = label
         self.cfg = cfg
         self.bbox_dir = bbox_dir
+        self.is_train = is_train
         self.bboxes = load_bboxes(bbox_dir, video_id)
 
-        self.transform = transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225]),
-        ])
+        # Use more augmentations for training
+        if is_train:
+            self.transform = transforms.Compose([
+                transforms.Resize((256, 256)),
+                transforms.RandomCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(brightness=0.1, contrast=0.1),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225]),
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((256, 256)),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225]),
+            ])
 
     def __len__(self):
         return 1
@@ -90,19 +103,29 @@ class SinglePickleFrameDataset(torch.utils.data.Dataset):
             step = max(1, len(self.frames)//num_frames_fast)
             fast_indices = [i for i in range(0, len(self.frames), step)][:num_frames_fast]
 
+        if len(fast_indices) < num_frames_fast:
+            # Pad with duplicates of last frame
+            fast_indices += [fast_indices[-1]] * (num_frames_fast - len(fast_indices))
+
         if len(self.frames) < num_frames_slow:
             slow_indices = list(range(len(self.frames))) + [len(self.frames)-1] * (num_frames_slow - len(self.frames))
         else:
             step = max(1, len(self.frames)//num_frames_slow)
             slow_indices = [i for i in range(0, len(self.frames), step)][:num_frames_slow]
+            
+        if len(slow_indices) < num_frames_slow:
+            # Pad with duplicates of last frame
+            slow_indices += [slow_indices[-1]] * (num_frames_slow - len(slow_indices))
 
         def crop_frame(frame, bbox):
             if bbox is None or len(bbox) != 4:
                 return frame
             x_min, y_min, x_max, y_max = map(int, bbox)
             h, w = frame.shape[:2]
+            # Add some padding around the bbox
             y_max_ext = min(h, y_max + 30)
-            x_min, x_max = max(0, x_min), min(w, x_max)
+            x_min, x_max = max(0, x_min - 10), min(w, x_max + 10)
+            y_min = max(0, y_min - 10)
             if x_max <= x_min or y_max_ext <= y_min:
                 return frame
             return frame[y_min:y_max_ext, x_min:x_max]
@@ -112,35 +135,47 @@ class SinglePickleFrameDataset(torch.utils.data.Dataset):
 
         # Fast
         for i in fast_indices:
-            frame = self.frames[i]
-            if isinstance(frame, torch.Tensor):
-                frame = frame.permute(1,2,0).numpy()
-            elif isinstance(frame, np.ndarray) and frame.ndim == 4 and frame.shape[0]==1:
-                frame = frame.squeeze(0)
-            if frame.dtype != np.uint8:
-                frame = (frame*255).astype(np.uint8) if frame.max()<=1.0 else frame.astype(np.uint8)
-            if frame.ndim!=3 or frame.shape[2]!=3:
-                frame = np.zeros((224,224,3),dtype=np.uint8)
-            bbox = (self.bboxes[i] if self.bboxes and i<len(self.bboxes) else None)
-            cropped = crop_frame(frame, bbox)
-            fast_original.append(cropped)
-            fast_processed.append(self.transform(Image.fromarray(cropped)))
+            try:
+                frame = self.frames[i]
+                if isinstance(frame, torch.Tensor):
+                    frame = frame.permute(1,2,0).numpy()
+                elif isinstance(frame, np.ndarray) and frame.ndim == 4 and frame.shape[0]==1:
+                    frame = frame.squeeze(0)
+                if frame.dtype != np.uint8:
+                    frame = (frame*255).astype(np.uint8) if frame.max()<=1.0 else frame.astype(np.uint8)
+                if frame.ndim!=3 or frame.shape[2]!=3:
+                    frame = np.zeros((224,224,3),dtype=np.uint8)
+                bbox = (self.bboxes[i] if self.bboxes and i<len(self.bboxes) else None)
+                cropped = crop_frame(frame, bbox)
+                fast_original.append(cropped)
+                fast_processed.append(self.transform(Image.fromarray(cropped)))
+            except Exception as e:
+                logger.warning(f"Error processing fast frame {i}: {e}")
+                # Create a blank frame if processing fails
+                fast_original.append(np.zeros((224,224,3), dtype=np.uint8))
+                fast_processed.append(torch.zeros((3, 224, 224)))
 
         # Slow
         for i in slow_indices:
-            frame = self.frames[i]
-            if isinstance(frame, torch.Tensor):
-                frame = frame.permute(1,2,0).numpy()
-            elif isinstance(frame, np.ndarray) and frame.ndim == 4 and frame.shape[0]==1:
-                frame = frame.squeeze(0)
-            if frame.dtype != np.uint8:
-                frame = (frame*255).astype(np.uint8) if frame.max()<=1.0 else frame.astype(np.uint8)
-            if frame.ndim!=3 or frame.shape[2]!=3:
-                frame = np.zeros((224,224,3),dtype=np.uint8)
-            bbox = (self.bboxes[i] if self.bboxes and i<len(self.bboxes) else None)
-            cropped = crop_frame(frame, bbox)
-            slow_original.append(cropped)
-            slow_processed.append(self.transform(Image.fromarray(cropped)))
+            try:
+                frame = self.frames[i]
+                if isinstance(frame, torch.Tensor):
+                    frame = frame.permute(1,2,0).numpy()
+                elif isinstance(frame, np.ndarray) and frame.ndim == 4 and frame.shape[0]==1:
+                    frame = frame.squeeze(0)
+                if frame.dtype != np.uint8:
+                    frame = (frame*255).astype(np.uint8) if frame.max()<=1.0 else frame.astype(np.uint8)
+                if frame.ndim!=3 or frame.shape[2]!=3:
+                    frame = np.zeros((224,224,3),dtype=np.uint8)
+                bbox = (self.bboxes[i] if self.bboxes and i<len(self.bboxes) else None)
+                cropped = crop_frame(frame, bbox)
+                slow_original.append(cropped)
+                slow_processed.append(self.transform(Image.fromarray(cropped)))
+            except Exception as e:
+                logger.warning(f"Error processing slow frame {i}: {e}")
+                # Create a blank frame if processing fails
+                slow_original.append(np.zeros((224,224,3), dtype=np.uint8))
+                slow_processed.append(torch.zeros((3, 224, 224)))
 
         # Stack tensors
         if fast_processed and slow_processed:
@@ -179,7 +214,7 @@ def modify_slowfast_head(model, num_classes, device):
     return model
 
 
-# Grad-CAM implementation for SlowFast
+# Improved Grad-CAM implementation for SlowFast
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
@@ -193,14 +228,14 @@ class GradCAM:
         self.hook_handles.append(target_layer.register_backward_hook(self.save_gradients))
 
     def save_activations(self, module, input, output):
-        self.activations = output
+        self.activations = output.detach()
 
     def save_gradients(self, module, grad_input, grad_output):
-        self.gradients = grad_output[0]
+        self.gradients = grad_output[0].detach()
 
     def __call__(self, inputs, target_class=None):
         """
-        Compute Grad-CAM heatmap for the target class.
+        Compute Grad-CAM heatmap for the target class with memory optimization.
         Args:
             inputs: Input tensors [slow_tensor, fast_tensor].
             target_class: Target class index for Grad-CAM. If None, use the predicted class.
@@ -210,26 +245,29 @@ class GradCAM:
         self.model.eval()
         self.model.zero_grad()
 
-        # Forward pass
-        outputs, _ = self.model(inputs)
+        # Forward pass with memory optimization
+        with torch.cuda.amp.autocast():
+            outputs, _ = self.model(inputs)
+            
         if target_class is None:
             target_class = outputs.argmax(dim=1).item()
 
-        # Backward pass to get gradients
-        outputs[:, target_class].backward()
+        # Backward pass to get gradients - do one sample at a time to save memory
+        target = outputs[0, target_class]
+        target.backward()
 
-        # Compute Grad-CAM
-        gradients = self.gradients  # Shape: (B, C, T, H, W)
-        activations = self.activations  # Shape: (B, C, T, H, W)
+        # Compute Grad-CAM - use only the first sample to save memory
+        gradients = self.gradients[0]  # Only use first sample
+        activations = self.activations[0]  # Only use first sample
 
-        # Average gradients over the channel dimension
-        weights = torch.mean(gradients, dim=[0, 3, 4], keepdim=True)  # Shape: (1, C, T, 1, 1)
-        heatmap = torch.sum(weights * activations, dim=1).squeeze()  # Shape: (T, H, W)
+        # Average gradients over the spatial dimensions
+        weights = torch.mean(gradients, dim=[1, 2], keepdim=True)
+        heatmap = torch.sum(weights * activations, dim=0)
 
-        # Apply ReLU
+        # Apply ReLU to focus on features that have a positive influence
         heatmap = torch.maximum(heatmap, torch.tensor(0.0, device=heatmap.device))
 
-        # Normalize the heatmap
+        # Normalize the heatmap for each frame
         for t in range(heatmap.shape[0]):
             frame_heatmap = heatmap[t]
             max_val = torch.max(frame_heatmap) + 1e-8
@@ -282,6 +320,9 @@ def visualize_gradcam_heatmaps(heatmaps, slow_frames, fast_frames, video_id, out
 
     # Visualize slow pathway
     for t in range(len(slow_frames)):
+        if t >= heatmaps['slow'].shape[0]:
+            continue  # Skip if frame index exceeds heatmap dimensions
+            
         plt.figure(figsize=(10, 5))
         plt.subplot(1, 2, 1)
         frame = np.squeeze(slow_frames[t])
@@ -291,10 +332,16 @@ def visualize_gradcam_heatmaps(heatmaps, slow_frames, fast_frames, video_id, out
 
         plt.subplot(1, 2, 2)
         heatmap = heatmaps['slow'][t]  # Shape: (H, W)
-        heatmap = cv2.resize(heatmap, (frame.shape[1], frame.shape[0]))
-        heatmap = cv2.GaussianBlur(heatmap, (5, 5), 0)  # Smooth to reduce noise
-        plt.imshow(heatmap, cmap='jet', alpha=0.5)
-        plt.imshow(frame, alpha=0.5)  # Overlay the heatmap on the original frame
+        # Safely resize heatmap to match frame dimensions
+        try:
+            heatmap = cv2.resize(heatmap, (frame.shape[1], frame.shape[0]))
+            heatmap = cv2.GaussianBlur(heatmap, (5, 5), 0)  # Smooth to reduce noise
+            plt.imshow(heatmap, cmap='jet', alpha=0.5)
+            plt.imshow(frame, alpha=0.5)  # Overlay the heatmap on the original frame
+        except Exception as e:
+            logger.warning(f"Error visualizing slow heatmap {t}: {e}")
+            plt.imshow(frame)  # Just show the frame if visualization fails
+            
         plt.title(f"Slow Grad-CAM {t+1}")
         plt.axis('off')
 
@@ -304,6 +351,9 @@ def visualize_gradcam_heatmaps(heatmaps, slow_frames, fast_frames, video_id, out
 
     # Visualize fast pathway
     for t in range(len(fast_frames)):
+        if t >= heatmaps['fast'].shape[0]:
+            continue  # Skip if frame index exceeds heatmap dimensions
+            
         plt.figure(figsize=(10, 5))
         plt.subplot(1, 2, 1)
         frame = np.squeeze(fast_frames[t])
@@ -313,10 +363,16 @@ def visualize_gradcam_heatmaps(heatmaps, slow_frames, fast_frames, video_id, out
 
         plt.subplot(1, 2, 2)
         heatmap = heatmaps['fast'][t]  # Shape: (H, W)
-        heatmap = cv2.resize(heatmap, (frame.shape[1], frame.shape[0]))
-        heatmap = cv2.GaussianBlur(heatmap, (5, 5), 0)  # Smooth to reduce noise
-        plt.imshow(heatmap, cmap='jet', alpha=0.5)
-        plt.imshow(frame, alpha=0.5)  # Overlay the heatmap on the original frame
+        # Safely resize heatmap to match frame dimensions
+        try:
+            heatmap = cv2.resize(heatmap, (frame.shape[1], frame.shape[0]))
+            heatmap = cv2.GaussianBlur(heatmap, (5, 5), 0)  # Smooth to reduce noise
+            plt.imshow(heatmap, cmap='jet', alpha=0.5)
+            plt.imshow(frame, alpha=0.5)  # Overlay the heatmap on the original frame
+        except Exception as e:
+            logger.warning(f"Error visualizing fast heatmap {t}: {e}")
+            plt.imshow(frame)  # Just show the frame if visualization fails
+            
         plt.title(f"Fast Grad-CAM {t+1}")
         plt.axis('off')
 
@@ -349,34 +405,91 @@ def perform_inference(test_loader, model, cfg):
         }
     }
 
+    # Create directories in advance
+    for depth in layers_to_test:
+        os.makedirs(os.path.join(cfg.OUTPUT_DIR, f"gradcam_{depth}"), exist_ok=True)
+    os.makedirs(os.path.join(cfg.OUTPUT_DIR, "features"), exist_ok=True)
+    
+    # Track class predictions and their confidences
+    predictions = []
+    device = next(model.parameters()).device
+
     for inputs, video_id, slow_frames, fast_frames, labels in test_loader:
         logger.info(f"Processing video: {video_id[0]}")
         logger.debug(f"Input slow shape: {inputs[0].shape}, fast shape: {inputs[1].shape}")
-        inputs = [inp.cuda(non_blocking=True) for inp in inputs]
+        
+        # Move inputs to the device with error handling
+        try:
+            inputs = [inp.to(device, non_blocking=True) for inp in inputs]
+            labels = labels.to(device, non_blocking=True)
+        except Exception as e:
+            logger.error(f"Error moving inputs to device: {e}")
+            continue
 
         # Extract and visualize Grad-CAM heatmaps from different layers
-        for depth, layers in layers_to_test.items():
-            target_layer_slow = layers['slow']
-            target_layer_fast = layers['fast']
-            heatmaps = extract_gradcam_heatmaps(model, target_layer_slow, target_layer_fast, inputs)
-            logger.debug(f"{depth.capitalize()} - Slow Grad-CAM shape: {heatmaps['slow'].shape}")
-            logger.debug(f"{depth.capitalize()} - Fast Grad-CAM shape: {heatmaps['fast'].shape}")
-            gradcam_dir = os.path.join(cfg.OUTPUT_DIR, f"gradcam_{depth}")
-            visualize_gradcam_heatmaps(heatmaps, slow_frames, fast_frames, video_id[0], gradcam_dir)
+        try:
+            for depth, layers in layers_to_test.items():
+                target_layer_slow = layers['slow']
+                target_layer_fast = layers['fast']
+                heatmaps = extract_gradcam_heatmaps(model, target_layer_slow, target_layer_fast, inputs)
+                logger.debug(f"{depth.capitalize()} - Slow Grad-CAM shape: {heatmaps['slow'].shape}")
+                logger.debug(f"{depth.capitalize()} - Fast Grad-CAM shape: {heatmaps['fast'].shape}")
+                gradcam_dir = os.path.join(cfg.OUTPUT_DIR, f"gradcam_{depth}")
+                visualize_gradcam_heatmaps(heatmaps, slow_frames[0], fast_frames[0], video_id[0], gradcam_dir)
+        except Exception as e:
+            logger.error(f"Error generating Grad-CAM for {video_id[0]}: {e}")
 
-        # Extract features for the video
-        model.eval()
-        preds, feat = model(inputs)
-        if cfg.NUM_GPUS > 1:
-            preds, feat = du.all_gather([preds, feat])
-        feat = feat.cpu().numpy()
-        out_path = os.path.join(cfg.OUTPUT_DIR, "features")
-        os.makedirs(out_path, exist_ok=True)
-        out_file = f"{video_id[0]}_slowfast_features.npy"
-        np.save(os.path.join(out_path, out_file), feat)
-        logger.info(f"Saved features for {video_id[0]} to {os.path.join(out_path, out_file)}")
-        del inputs, preds, feat
+        # Extract features for the video with error handling
+        try:
+            model.eval()
+            with torch.cuda.amp.autocast():
+                preds, feat = model(inputs)
+            
+            if cfg.NUM_GPUS > 1:
+                # Safely gather results from multiple GPUs
+                try:
+                    preds, feat = du.all_gather([preds, feat])
+                except Exception as e:
+                    logger.error(f"Error gathering from multiple GPUs: {e}")
+            
+            # Track predictions
+            probs = torch.softmax(preds, dim=1)
+            pred_class = torch.argmax(preds, dim=1)[0].item()
+            confidence = probs[0, pred_class].item()
+            true_class = labels[0].item()
+            predictions.append({
+                'video_id': video_id[0],
+                'predicted': pred_class,
+                'true': true_class,
+                'confidence': confidence,
+                'correct': pred_class == true_class
+            })
+            
+            # Save features
+            feat = feat.cpu().numpy()
+            out_file = f"{video_id[0]}_slowfast_features.npy"
+            np.save(os.path.join(cfg.OUTPUT_DIR, "features", out_file), feat)
+            logger.info(f"Saved features for {video_id[0]} to {os.path.join(cfg.OUTPUT_DIR, 'features', out_file)}")
+        except Exception as e:
+            logger.error(f"Error extracting features for {video_id[0]}: {e}")
+        
+        # Clean up memory
+        del inputs, labels
+        if 'preds' in locals(): del preds
+        if 'feat' in locals(): del feat
         torch.cuda.empty_cache()
+
+    # Save predictions summary
+    try:
+        import pandas as pd
+        pd.DataFrame(predictions).to_csv(os.path.join(cfg.OUTPUT_DIR, "test_predictions.csv"), index=False)
+        
+        # Calculate and log accuracy
+        if predictions:
+            accuracy = sum(p['correct'] for p in predictions) / len(predictions)
+            logger.info(f"Test accuracy: {accuracy:.4f}")
+    except Exception as e:
+        logger.error(f"Error saving prediction summary: {e}")
 
 
 def train(cfg, train_loader, val_loader, model):
@@ -389,36 +502,89 @@ def train(cfg, train_loader, val_loader, model):
         if any(s in name for s in ["s1", "s2", "s3"]):
             param.requires_grad = False
 
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
-    criterion = torch.nn.CrossEntropyLoss()
+    # Count trainable parameters
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Trainable parameters: {trainable_params:,}")
 
+    # Optimizer and scheduler setup
+    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
+    criterion = torch.nn.CrossEntropyLoss()
+    
+    # Mixed precision training
+    scaler = GradScaler()
+    
+    # Training configuration
     num_epochs = 10
+    best_val_acc = 0.0
+    patience = 5  # Early stopping patience
+    patience_counter = 0
+    
+    # Training history
+    history = {
+        'train_loss': [],
+        'train_acc': [],
+        'val_loss': [],
+        'val_acc': []
+    }
+    
+    # Gradient accumulation setup for effective larger batch size
+    target_batch_size = 8  # Target effective batch size
+    actual_batch_size = cfg.TRAIN.BATCH_SIZE if hasattr(cfg.TRAIN, 'BATCH_SIZE') else 4
+    
+    # Ensure we don't divide by zero
+    if actual_batch_size <= 0:
+        logger.warning(f"Invalid batch size: {actual_batch_size}. Setting to 1.")
+        actual_batch_size = 1
+        
+    accumulation_steps = max(1, target_batch_size // actual_batch_size)
+    logger.info(f"Using gradient accumulation: {accumulation_steps} steps (batch size {actual_batch_size})")
+
+    
     for epoch in range(num_epochs):
+        # Training phase
         model.train()
         train_loss = train_correct = train_total = 0
-
-        for inputs, video_id, _, _, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+        optimizer.zero_grad()  # Zero gradients before epoch starts
+        
+        for i, (inputs, video_id, _, _, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
             inputs = [inp.to(device) for inp in inputs]
             labels = labels.to(device)
+            
+            # Forward pass with mixed precision
+            with autocast():
+                outputs, _ = model(inputs)
+                loss = criterion(outputs, labels) / accumulation_steps  # Scale for accumulation
+                
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            
+            # Update weights after accumulation_steps or at the end of epoch
+            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            
+            # Track metrics (scale loss back for reporting)
+            train_loss += loss.item() * accumulation_steps
+            _, pred = outputs.max(1)
+            train_total += labels.size(0)
+            train_correct += (pred == labels).sum().item()
+            
+            # Clean up memory
+            del inputs, outputs, labels, loss
+            torch.cuda.empty_cache()
 
-            optimizer.zero_grad()
-            outputs, _ = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            train_loss   += loss.item()
-            _, pred       = outputs.max(1)
-            train_total  += labels.size(0)
-            train_correct+= (pred == labels).sum().item()
-
-        logger.info(f"Epoch {epoch+1}: Train Loss {train_loss/train_total:.4f}, Acc {100*train_correct/train_total:.2f}%")
+        train_acc = 100 * train_correct / train_total
+        logger.info(f"Epoch {epoch+1}: Train Loss {train_loss/len(train_loader):.4f}, Acc {train_acc:.2f}%")
+        
+        # Validation phase
         model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
+        val_loss = val_correct = val_total = 0
+        val_preds, val_targets = [], []
+        
         with torch.no_grad():
-            for inputs, video_id, slow_frames, fast_frames, labels in val_loader:
+            for inputs, video_id, _, _, labels in val_loader:
                 inputs = [inp.to(device) for inp in inputs]
                 labels = labels.to(device)
                 
@@ -429,13 +595,98 @@ def train(cfg, train_loader, val_loader, model):
                 _, predicted = torch.max(outputs, 1)
                 val_total += labels.size(0)
                 val_correct += (predicted == labels).sum().item()
+                
+                # Save predictions for analysis
+                val_preds.extend(predicted.cpu().numpy())
+                val_targets.extend(labels.cpu().numpy())
+                
+                # Clean up memory
+                del inputs, outputs, labels
+                torch.cuda.empty_cache()
         
         val_acc = 100 * val_correct / val_total
-        logger.info(f"Epoch {epoch+1}/{num_epochs}, Val Loss: {val_loss/val_total:.4f}, Val Acc: {val_acc:.2f}%")
-
-    torch.save(model.state_dict(), os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned.pt"))
+        logger.info(f"Epoch {epoch+1}/{num_epochs}, Val Loss: {val_loss/len(val_loader):.4f}, Val Acc: {val_acc:.2f}%")
+        
+        # Update scheduler based on validation accuracy
+        scheduler.step(val_acc)
+        
+        # Track history
+        history['train_loss'].append(train_loss/len(train_loader))
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss/len(val_loader))
+        history['val_acc'].append(val_acc)
+        
+        # Save best model
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save({
+                'epoch': epoch + 1,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'best_val_acc': best_val_acc,
+                'scaler': scaler.state_dict()
+            }, os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_best.pt"))
+            logger.info(f"New best model saved with validation accuracy: {val_acc:.2f}%")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        # Early stopping check
+        if patience_counter >= patience:
+            logger.info(f"Early stopping triggered after {epoch+1} epochs")
+            break
+            
+        # Save checkpoint
+        if (epoch + 1) % 2 == 0:  # Save every 2 epochs
+            torch.save({
+                'epoch': epoch + 1,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'best_val_acc': best_val_acc,
+                'scaler': scaler.state_dict(),
+                'history': history
+            }, os.path.join(cfg.OUTPUT_DIR, f"slowfast_checkpoint_epoch{epoch+1}.pt"))
+    
+    # Save final model
+    torch.save({
+        'epoch': epoch + 1,
+        'state_dict': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'best_val_acc': best_val_acc,
+        'history': history
+    }, os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_final.pt"))
+    
+    # Plot and save training history
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Val Loss')
+    plt.title('Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history['train_acc'], label='Train Accuracy')
+    plt.plot(history['val_acc'], label='Val Accuracy')
+    plt.title('Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.OUTPUT_DIR, "training_history.png"))
+    plt.close()
+    
+    # Load best model for return
+    best_checkpoint = torch.load(os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_best.pt"))
+    model.load_state_dict(best_checkpoint['state_dict'])
+    logger.info(f"Loaded best model with validation accuracy: {best_checkpoint['best_val_acc']:.2f}%")
+    
     return model
-
 
 def test(cfg):
     """
