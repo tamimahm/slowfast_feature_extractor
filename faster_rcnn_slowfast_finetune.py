@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 
+# Configuration flag: 
+# 0 = do fine-tuning and then testing
+# 1 = load saved fine-tuned model and run testing only
+USE_PRETRAINED_FINETUNED = 1  # Change this value to 1 to load fine tuned model
+FREEZE_LOWER_LAYERS = 1  # Set this to 0 to unfreeze all layers
+AGREESIVE_AUGMENTATION =0  # Set this to 1 for agrresive augmentation
+MLP_HEAD=0# set this to 1 for MLP complex head for classificaiton
+# Add this at the top of your code along with other global flags
+MODEL_FUSION = 0  # Set to 1 to enable feature fusion, 0 for standard inference
+USE_LAYER_SPECIFIC_LR = 0  # Set to 1 to enable layer-specific learning rates, 0 for
 import numpy as np
 import torch
 import os
@@ -15,7 +25,7 @@ import matplotlib.pyplot as plt
 import cv2
 from sklearn.model_selection import train_test_split
 from torch.cuda.amp import autocast, GradScaler
-
+import torch.nn as nn
 # Suppress specific warnings from torchvision
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.transforms._transforms_video")
 
@@ -35,29 +45,30 @@ logger = logging.get_logger(__name__)
 def load_bboxes(bbox_dir, video_id):
     """
     Load bounding box data for a video segment.
+    Returns the bounding boxes if found, or None and the missing filename if not found.
     """
     bbox_file = os.path.join(bbox_dir, f"{video_id}_bboxes.pkl")
     if not os.path.exists(bbox_file):
         logger.warning(f"No bounding box file found for {video_id} at {bbox_file}")
-        return None
+        return None, f"{video_id}_bboxes.pkl"  # Return None and the missing filename
 
     try:
         with open(bbox_file, 'rb') as f:
             bboxes = pickle.load(f)
     except Exception as e:
         logger.error(f"Error loading bounding box file for {video_id}: {e}")
-        return None
+        return None, f"{video_id}_bboxes.pkl"  # Also track error cases
 
     if not isinstance(bboxes, list) or not bboxes:
         logger.error(f"Invalid bounding box data for {video_id}: expected a non-empty list, got {type(bboxes)}")
-        return None
+        return None, f"{video_id}_bboxes.pkl"  # Also track invalid data
 
     for i, box in enumerate(bboxes):
         if not isinstance(box, (list, np.ndarray)) or len(box) != 4:
             logger.error(f"Invalid bounding box at frame {i} for {video_id}: expected 4 values, got {box}")
-            return None
+            return None, f"{video_id}_bboxes.pkl"  # Also track invalid boxes
 
-    return bboxes
+    return bboxes, None  # Return boxes and None for the filename (indicating success)
 
 
 class SinglePickleFrameDataset(torch.utils.data.Dataset):
@@ -68,18 +79,36 @@ class SinglePickleFrameDataset(torch.utils.data.Dataset):
         self.cfg = cfg
         self.bbox_dir = bbox_dir
         self.is_train = is_train
-        self.bboxes = load_bboxes(bbox_dir, video_id)
-
+        # Track missing bbox files
+        self.bboxes, missing_file = load_bboxes(bbox_dir, video_id)
+        # If this is the first dataset instance, initialize a global list to track missing files
+        if not hasattr(SinglePickleFrameDataset, 'missing_bbox_files'):
+            SinglePickleFrameDataset.missing_bbox_files = []
+        
+        # Add the missing file to the global list if it's not None
+        if missing_file is not None:
+            SinglePickleFrameDataset.missing_bbox_files.append(missing_file)
         # Use more augmentations for training
         if is_train:
-            self.transform = transforms.Compose([
-                transforms.Resize((256, 256)),
-                transforms.RandomCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ColorJitter(brightness=0.1, contrast=0.1),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225]),
-            ])
+            if AGREESIVE_AUGMENTATION==0:
+                self.transform = transforms.Compose([
+                    transforms.Resize((256, 256)),
+                    transforms.RandomCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ColorJitter(brightness=0.1, contrast=0.1),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225]),
+                ])
+            else: 
+                self.transform = transforms.Compose([
+                    transforms.Resize((256, 256)),
+                    transforms.RandomCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.1),
+                    transforms.RandomAffine(degrees=10, translate=(0.1, 0.1)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225]),
+                ])
         else:
             self.transform = transforms.Compose([
                 transforms.Resize((256, 256)),
@@ -209,8 +238,21 @@ def fastslow_collate_fn(batch):
 
 def modify_slowfast_head(model, num_classes, device):
     in_features = model.head.projection.in_features
-    model.head.projection = torch.nn.Linear(in_features, num_classes).to(device)
-    logger.info(f"Modified SlowFast head to {num_classes} classes on {device}")
+    if MLP_HEAD==0:
+        model.head.projection = torch.nn.Linear(in_features, num_classes).to(device)
+        logger.info(f"Modified SlowFast head to {num_classes} classes on {device}")
+    else:
+        model.head.projection = nn.Sequential(
+        nn.Linear(in_features, 512),
+        nn.ReLU(),
+        nn.Dropout(0.5),
+        nn.Linear(512, 128),
+        nn.ReLU(),
+        nn.Dropout(0.3),
+        nn.Linear(128, num_classes)
+    ).to(device)
+
+
     return model
 
 
@@ -380,7 +422,8 @@ def visualize_gradcam_heatmaps(heatmaps, slow_frames, fast_frames, video_id, out
         plt.savefig(os.path.join(output_dir, f"{video_id}_fast_gradcam_{t+1}.png"))
         plt.close()
 
-# Function to perform inference and visualize Grad-CAM heatmaps
+
+
 @torch.no_grad()
 def perform_inference(test_loader, model, cfg):
     """
@@ -390,30 +433,32 @@ def perform_inference(test_loader, model, cfg):
         model: SlowFast model.
         cfg: SlowFast configuration object.
     """
-    layers_to_test = {
-        'low': {
-            'slow': model.s2.pathway0_res0,
-            'fast': model.s2.pathway1_res0
-        },
-        'mid': {
-            'slow': model.s3.pathway0_res2,
-            'fast': model.s3.pathway1_res2
-        },
-        'deep': {
-            'slow': model.s5.pathway0_res0,
-            'fast': model.s5.pathway1_res0
-        }
-    }
-
     # Create directories in advance
-    for depth in layers_to_test:
-        os.makedirs(os.path.join(cfg.OUTPUT_DIR, f"gradcam_{depth}"), exist_ok=True)
     os.makedirs(os.path.join(cfg.OUTPUT_DIR, "features"), exist_ok=True)
+    for depth in ['low', 'mid', 'deep']:
+        os.makedirs(os.path.join(cfg.OUTPUT_DIR, f"gradcam_{depth}"), exist_ok=True)
     
     # Track class predictions and their confidences
     predictions = []
     device = next(model.parameters()).device
-
+    
+    # Set up feature fusion if enabled
+    activation = {}
+    if MODEL_FUSION:
+        logger.info("Using feature fusion from multiple network layers")
+        # Register hooks to capture intermediate features
+        def get_activation(name):
+            def hook(model, input, output):
+                activation[name] = output
+            return hook
+        
+        # Register hooks for different layers
+        hook_handles = []
+        hook_handles.append(model.s3.pathway0_res2.register_forward_hook(get_activation('s3')))
+        hook_handles.append(model.s4.pathway0_res2.register_forward_hook(get_activation('s4')))
+        hook_handles.append(model.s5.pathway0_res2.register_forward_hook(get_activation('s5')))
+    
+    # Process each batch
     for inputs, video_id, slow_frames, fast_frames, labels in test_loader:
         logger.info(f"Processing video: {video_id[0]}")
         logger.debug(f"Input slow shape: {inputs[0].shape}, fast shape: {inputs[1].shape}")
@@ -426,37 +471,80 @@ def perform_inference(test_loader, model, cfg):
             logger.error(f"Error moving inputs to device: {e}")
             continue
 
-        # Extract and visualize Grad-CAM heatmaps from different layers
+        # Extract Grad-CAM visualizations
         try:
-            for depth, layers in layers_to_test.items():
-                target_layer_slow = layers['slow']
-                target_layer_fast = layers['fast']
-                heatmaps = extract_gradcam_heatmaps(model, target_layer_slow, target_layer_fast, inputs)
-                logger.debug(f"{depth.capitalize()} - Slow Grad-CAM shape: {heatmaps['slow'].shape}")
-                logger.debug(f"{depth.capitalize()} - Fast Grad-CAM shape: {heatmaps['fast'].shape}")
-                gradcam_dir = os.path.join(cfg.OUTPUT_DIR, f"gradcam_{depth}")
-                visualize_gradcam_heatmaps(heatmaps, slow_frames[0], fast_frames[0], video_id[0], gradcam_dir)
+            layers_to_test = {
+                'low': {
+                    'slow': model.s2.pathway0_res0,
+                    'fast': model.s2.pathway1_res0
+                },
+                'mid': {
+                    'slow': model.s3.pathway0_res2,
+                    'fast': model.s3.pathway1_res2
+                },
+                'deep': {
+                    'slow': model.s5.pathway0_res0,
+                    'fast': model.s5.pathway1_res0
+                }
+            }
+            
+            # for depth, layers in layers_to_test.items():
+            #     target_layer_slow = layers['slow']
+            #     target_layer_fast = layers['fast']
+            #     heatmaps = extract_gradcam_heatmaps(model, target_layer_slow, target_layer_fast, inputs)
+            #     gradcam_dir = os.path.join(cfg.OUTPUT_DIR, f"gradcam_{depth}")
+            #     visualize_gradcam_heatmaps(heatmaps, slow_frames[0], fast_frames[0], video_id[0], gradcam_dir)
         except Exception as e:
             logger.error(f"Error generating Grad-CAM for {video_id[0]}: {e}")
 
-        # Extract features for the video with error handling
+        # Extract features for the video
         try:
             model.eval()
             with torch.cuda.amp.autocast():
-                preds, feat = model(inputs)
+                outputs, feat = model(inputs)
             
-            if cfg.NUM_GPUS > 1:
-                # Safely gather results from multiple GPUs
-                try:
-                    preds, feat = du.all_gather([preds, feat])
-                except Exception as e:
-                    logger.error(f"Error gathering from multiple GPUs: {e}")
+            if MODEL_FUSION:
+                # Process the intermediate features
+                def process_features(feat_data):
+                    if isinstance(feat_data, tuple):
+                        # Handle pathway format
+                        pathway0 = feat_data[0]  # slow pathway
+                        pathway1 = feat_data[1]  # fast pathway
+                        
+                        # Global average pooling
+                        pooled0 = torch.mean(pathway0, dim=[2, 3, 4])  # Average over T, H, W
+                        pooled1 = torch.mean(pathway1, dim=[2, 3, 4])  # Average over T, H, W
+                        
+                        # Concatenate both pathways
+                        return torch.cat([pooled0, pooled1], dim=1)
+                    else:
+                        # If it's already processed
+                        return torch.mean(feat_data, dim=[2, 3, 4])
+                
+                # Process all features
+                s3_processed = process_features(activation['s3'])
+                s4_processed = process_features(activation['s4'])
+                s5_processed = process_features(activation['s5'])
+                
+                # Combine features from different layers
+                fused_features = torch.cat([s3_processed, s4_processed, s5_processed], dim=1)
+                
+                # Save the fused features
+                # fused_feat_np = fused_features.cpu().numpy()
+                # np.save(os.path.join(cfg.OUTPUT_DIR, "features", f"{video_id[0]}_fused_features.npy"), fused_feat_np)
+                
+                # # Use fused features for the final prediction
+                # logger.info(f"Using fused features for prediction (shape: {fused_feat_np.shape})")
+                
+                # We'd need a classifier for these fused features
+                # For now, we'll still use the original model's output
             
-            # Track predictions
-            probs = torch.softmax(preds, dim=1)
-            pred_class = torch.argmax(preds, dim=1)[0].item()
+            # Track predictions using the model's outputs
+            probs = torch.softmax(outputs, dim=1)
+            pred_class = torch.argmax(outputs, dim=1)[0].item()
             confidence = probs[0, pred_class].item()
             true_class = labels[0].item()
+            
             predictions.append({
                 'video_id': video_id[0],
                 'predicted': pred_class,
@@ -465,19 +553,25 @@ def perform_inference(test_loader, model, cfg):
                 'correct': pred_class == true_class
             })
             
-            # Save features
-            feat = feat.cpu().numpy()
-            out_file = f"{video_id[0]}_slowfast_features.npy"
-            np.save(os.path.join(cfg.OUTPUT_DIR, "features", out_file), feat)
-            logger.info(f"Saved features for {video_id[0]} to {os.path.join(cfg.OUTPUT_DIR, 'features', out_file)}")
+            # Save standard features
+            # feat_np = feat.cpu().numpy()
+            # np.save(os.path.join(cfg.OUTPUT_DIR, "features", f"{video_id[0]}_features.npy"), feat_np)
+            # logger.info(f"Saved features for {video_id[0]}")
+            
         except Exception as e:
             logger.error(f"Error extracting features for {video_id[0]}: {e}")
         
         # Clean up memory
         del inputs, labels
-        if 'preds' in locals(): del preds
+        if 'outputs' in locals(): del outputs
         if 'feat' in locals(): del feat
+        if MODEL_FUSION and 'fused_features' in locals(): del fused_features
         torch.cuda.empty_cache()
+
+    # Clean up hooks if they were registered
+    if MODEL_FUSION:
+        for handle in hook_handles:
+            handle.remove()
 
     # Save predictions summary
     try:
@@ -490,6 +584,7 @@ def perform_inference(test_loader, model, cfg):
             logger.info(f"Test accuracy: {accuracy:.4f}")
     except Exception as e:
         logger.error(f"Error saving prediction summary: {e}")
+
 
 
 def train(cfg, train_loader, val_loader, model):
@@ -506,8 +601,55 @@ def train(cfg, train_loader, val_loader, model):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Trainable parameters: {trainable_params:,}")
 
-    # Optimizer and scheduler setup
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=1e-5)
+    # Set up optimizer based on learning rate strategy
+    if USE_LAYER_SPECIFIC_LR:
+        logger.info("Using layer-specific learning rates")
+        # Create mutually exclusive parameter groups to avoid the "parameters appear in more than one group" error
+        head_params = []
+        s5_params = []
+        s4_params = []
+        other_params = []
+        
+        # Categorize parameters into mutually exclusive groups
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue  # Skip frozen parameters
+                
+            if 'head' in name:
+                head_params.append(param)
+            elif 's5' in name:
+                s5_params.append(param)
+            elif 's4' in name:
+                s4_params.append(param)
+            elif not any(x in name for x in ['s1', 's2', 's3']):  # Exclude frozen layers
+                other_params.append(param)
+        
+        # Create parameter groups with different learning rates
+        param_groups = [
+            {'params': head_params, 'lr': 1e-3},  # Higher LR for head
+            {'params': s5_params, 'lr': 5e-5},    # Medium LR for s5
+            {'params': s4_params, 'lr': 2e-5},    # Lower LR for s4
+            {'params': other_params, 'lr': 1e-5}  # Even lower LR for any other layers
+        ]
+        
+        # Only include non-empty groups in the optimizer
+        param_groups = [g for g in param_groups if len(g['params']) > 0]
+        
+        optimizer = torch.optim.Adam(param_groups, weight_decay=1e-5)
+        
+        # Log parameter group sizes
+        for i, group in enumerate(param_groups):
+            logger.info(f"Parameter group {i}: {len(group['params'])} parameters, LR={group['lr']}")
+    else:
+        # Standard optimizer with uniform learning rate
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()), 
+            lr=1e-4, 
+            weight_decay=1e-5
+        )
+        logger.info("Using uniform learning rate of 1e-4 for all layers")
+
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
     criterion = torch.nn.CrossEntropyLoss()
     
@@ -540,7 +682,7 @@ def train(cfg, train_loader, val_loader, model):
     accumulation_steps = max(1, target_batch_size // actual_batch_size)
     logger.info(f"Using gradient accumulation: {accumulation_steps} steps (batch size {actual_batch_size})")
 
-    
+    # The rest of the function remains the same as your original implementation
     for epoch in range(num_epochs):
         # Training phase
         model.train()
@@ -682,7 +824,7 @@ def train(cfg, train_loader, val_loader, model):
     plt.close()
     
     # Load best model for return
-    best_checkpoint = torch.load(os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_best.pt"))
+    best_checkpoint = torch.load(os.path.join(cfg.OUTPUT_DIR+'\weights_best', "slowfast_finetuned_lower_freezed.pt"))
     model.load_state_dict(best_checkpoint['state_dict'])
     logger.info(f"Loaded best model with validation accuracy: {best_checkpoint['best_val_acc']:.2f}%")
     
@@ -708,7 +850,49 @@ def test(cfg):
     model = model.to(device)
     if du.is_master_proc() and cfg.LOG_MODEL_INFO:
         misc.log_model_info(model, cfg, use_train_input=False)
-    cu.load_test_checkpoint(cfg, model)
+    
+    # Check if we're using a pre-trained fine-tuned model or doing fine-tuning
+    if USE_PRETRAINED_FINETUNED:
+        # Path to the fine-tuned model
+        finetuned_model_path = os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_best.pt")
+        
+        if os.path.exists(finetuned_model_path):
+            logger.info(f"Loading fine-tuned model from {finetuned_model_path}")
+            # First load the pre-trained weights
+            cu.load_test_checkpoint(cfg, model)
+            # Then prepare model head for 2 classes
+            model = modify_slowfast_head(model, num_classes=2, device=device)
+            
+            # Load the fine-tuned weights with error handling
+            try:
+                # Load checkpoint which contains state_dict
+                checkpoint = torch.load(finetuned_model_path, map_location=device)
+                # Extract state_dict from the checkpoint
+                if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                    logger.info("Successfully extracted state_dict from checkpoint")
+                else:
+                    state_dict = checkpoint  # Assume it's directly the state_dict
+                
+                # Try loading with strict=False to allow partial loading
+                logger.info("Attempting to load fine-tuned weights")
+                model.load_state_dict(state_dict, strict=False)
+                logger.info("Successfully loaded fine-tuned weights")
+                
+                # Log validation accuracy if available
+                if isinstance(checkpoint, dict) and 'best_val_acc' in checkpoint:
+                    logger.info(f"Loaded model with validation accuracy: {checkpoint['best_val_acc']:.2f}%")
+            except Exception as e:
+                logger.error(f"Error loading fine-tuned weights: {e}")
+                logger.info("Falling back to the pre-trained model with modified head")
+        else:
+            logger.warning(f"Fine-tuned model not found at {finetuned_model_path}. Loading default checkpoint.")
+            cu.load_test_checkpoint(cfg, model)
+            model = modify_slowfast_head(model, num_classes=2, device=device)
+    else:
+        # Load the pre-trained weights for fine-tuning
+        logger.info("Loading pre-trained weights for fine-tuning")
+        cu.load_test_checkpoint(cfg, model)
 
     # Define paths
     pickle_dir = "D:/pickle_dir/fine_tune"
@@ -751,46 +935,76 @@ def test(cfg):
                             'video_id': video_id,
                             'label': label
                         })
-    # Split
-    train_segments, val_segments = train_test_split(
-        all_segments, test_size=0.2, random_state=42
-    )
-    logger.info(f"Train/Val split: {len(train_segments)}/{len(val_segments)} segments")
+
+    # If we're using a pre-trained model, use all data for inference
+    # Otherwise, split for training
+    if USE_PRETRAINED_FINETUNED:
+        logger.info(f"Using all {len(all_segments)} segments for inference with pre-trained model")
+        inference_segments = all_segments
+        train_segments = []  # Empty, not used
+    else:
+        # Split into train/validation sets
+        train_segments, inference_segments = train_test_split(
+            all_segments, test_size=0.2, random_state=42
+        )
+        logger.info(f"Train/Val split: {len(train_segments)}/{len(inference_segments)} segments")
 
     # ─── Create Datasets ────────────────────────────────────────────────────────
-    train_datasets = [
+    # Only create training datasets if we're going to fine-tune
+    if not USE_PRETRAINED_FINETUNED:
+        train_datasets = [
+            SinglePickleFrameDataset(
+                frames=seg["frames"],
+                video_id=seg["video_id"],
+                label=seg["label"],
+                cfg=cfg,
+                bbox_dir=bbox_dir,
+                is_train=True
+            )
+            for seg in train_segments
+        ]
+    else:
+        train_datasets = []  # Empty list, not used
+
+    # Always create inference datasets
+    inference_datasets = [
         SinglePickleFrameDataset(
             frames=seg["frames"],
             video_id=seg["video_id"],
             label=seg["label"],
             cfg=cfg,
             bbox_dir=bbox_dir,
+            is_train=False
         )
-        for seg in train_segments
-    ]
-    val_datasets = [
-        SinglePickleFrameDataset(
-            frames=seg["frames"],
-            video_id=seg["video_id"],
-            label=seg["label"],
-            cfg=cfg,
-            bbox_dir=bbox_dir,
-        )
-        for seg in val_segments
+        for seg in inference_segments
     ]
 
+    # After creating all datasets, save the list of missing bounding box files
+    if hasattr(SinglePickleFrameDataset, 'missing_bbox_files') and SinglePickleFrameDataset.missing_bbox_files:
+        missing_files_path = os.path.join(cfg.OUTPUT_DIR, "missing_bbox_files.txt")
+        with open(missing_files_path, 'w') as f:
+            for file in set(SinglePickleFrameDataset.missing_bbox_files):  # Use set to remove duplicates
+                f.write(f"{file}\n")
+        logger.info(f"Saved list of {len(set(SinglePickleFrameDataset.missing_bbox_files))} missing bounding box files to {missing_files_path}")
+    
     # ─── DataLoaders with custom collate_fn ─────────────────────────────────────
-    train_loader = torch.utils.data.DataLoader(
-        torch.utils.data.ConcatDataset(train_datasets),
-        batch_size=4,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
-        drop_last=False,
-        collate_fn=fastslow_collate_fn,
-    )
-    val_loader = torch.utils.data.DataLoader(
-        torch.utils.data.ConcatDataset(val_datasets),
+    # Only create training dataloader if we're fine-tuning
+    if not USE_PRETRAINED_FINETUNED:
+        train_loader = torch.utils.data.DataLoader(
+            torch.utils.data.ConcatDataset(train_datasets),
+            batch_size=4,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
+            drop_last=False,
+            collate_fn=fastslow_collate_fn,
+        )
+    else:
+        train_loader = None  # Not used
+
+    # Always create inference dataloader
+    inference_loader = torch.utils.data.DataLoader(
+        torch.utils.data.ConcatDataset(inference_datasets),
         batch_size=4,
         shuffle=False,
         num_workers=0,
@@ -799,10 +1013,14 @@ def test(cfg):
         collate_fn=fastslow_collate_fn,
     )
 
-    # Fine‑tune & inference
-    model = train(cfg, train_loader, val_loader, model)
-    perform_inference(val_loader, model, cfg)
-
+    # Fine‑tune & inference - only do fine-tuning if not using pre-trained model
+    if not USE_PRETRAINED_FINETUNED:
+        logger.info("Starting fine-tuning process...")
+        model = train(cfg, train_loader, inference_loader, model)
+        
+    # Run inference
+    logger.info("Starting inference process...")
+    perform_inference(inference_loader, model, cfg)
 
 def main():
     args = parse_args()
