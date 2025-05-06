@@ -4,13 +4,13 @@
 # Configuration flag: 
 # 0 = do fine-tuning and then testing
 # 1 = load saved fine-tuned model and run testing only
-USE_PRETRAINED_FINETUNED = 1  # Change this value to control the workflow
+USE_PRETRAINED_FINETUNED = 0  # Change this value to control the workflow
 # Add this at the top of your code with other global flags
 CLASS_IMBALANCE = 1  # Set to 1 to enable class weight balancing, 0 for original approach
 # Add this at the top of your code with other global flags
 BALANCED_SAMPLING = 1  # Set to 1 to enable balanced batch sampling, 0 for original approach
 # Add this at the top of your code with other global flags
-SAVE_HEATMAPS_FEATURES = 1  # Set to 1 to save heatmaps and features, 0 to ignore
+SAVE_HEATMAPS_FEATURES = 0  # Set to 1 to save heatmaps and features, 0 to ignore
 import numpy as np
 import torch
 import os
@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 import cv2
 from sklearn.model_selection import train_test_split
 from torch.cuda.amp import autocast, GradScaler
+import pandas as pd
 
 # Suppress specific warnings from torchvision
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.transforms._transforms_video")
@@ -40,7 +41,9 @@ from slowfast.utils.misc import launch_job
 from models import build_model
 
 logger = logging.get_logger(__name__)
-
+# Path to the CSV file with camera assignments
+ipsi_contra_csv = "D:\\Github\\Multi_view-automatic-assessment\\camera_assignments.csv"
+camera_box="bboxes_top"
 def load_bboxes(bbox_dir, video_id):
     """
     Load bounding box data for a video segment.
@@ -69,11 +72,13 @@ def load_bboxes(bbox_dir, video_id):
     return bboxes
 
 
+
 class SinglePickleFrameDataset(torch.utils.data.Dataset):
-    def __init__(self, frames, video_id, label, cfg, bbox_dir, is_train=True):
+    def __init__(self, frames, video_id, label, camera_id, cfg, bbox_dir, is_train=True):
         self.frames = frames
         self.video_id = video_id
         self.label = label
+        self.hand_id=camera_id
         self.cfg = cfg
         self.bbox_dir = bbox_dir
         self.is_train = is_train
@@ -132,9 +137,34 @@ class SinglePickleFrameDataset(torch.utils.data.Dataset):
             x_min, y_min, x_max, y_max = map(int, bbox)
             h, w = frame.shape[:2]
             # Add some padding around the bbox
-            y_max_ext = min(h, y_max + 30)
-            x_min, x_max = max(0, x_min - 10), min(w, x_max + 10)
-            y_min = max(0, y_min - 10)
+            if camera_box=='bboxes_top':
+                y_max_ext = min(h, y_max + 30)
+                x_min, x_max = max(0, x_min - 10), min(w, x_max + 10)
+                y_min = max(0, y_min )
+            else:
+                if self.hand_id=='cam4':
+                    y_max_ext = min(h, y_max - 20)
+                    x_min, x_max = max(0, x_min - 30), min(w, x_max )
+                    y_min = max(0, y_min ) 
+                else:
+                    y_max_ext = min(h, y_max - 20)
+                    x_min, x_max = max(0, x_min ), min(w, x_max +30)
+                    y_min = max(0, y_min )                                    
+                    # # Create a figure to display both images
+                    # plt.figure(figsize=(12, 6))
+                    
+                    # # Display original frame with bounding box
+                    # plt.subplot(1, 2, 1)
+                    # plt.imshow(frame)
+                    # plt.title("Original Frame with Bounding Box")
+                    # plt.axis('off')
+                    
+                    # # Display cropped frame
+                    # plt.subplot(1, 2, 2)
+                    # plt.imshow(frame[y_min:y_max_ext, x_min:x_max])
+                    # plt.title("Cropped Frame")
+                    # plt.axis('off')
+                    plt.show()
             if x_max <= x_min or y_max_ext <= y_min:
                 return frame
             return frame[y_min:y_max_ext, x_min:x_max]
@@ -412,13 +442,14 @@ def visualize_gradcam_heatmaps(heatmaps, slow_frames, fast_frames, video_id, out
 # Function to perform inference and visualize Grad-CAM heatmaps
 @torch.no_grad()
 
-def perform_inference(test_loader, model, cfg):
+def perform_inference(test_loader, model, cfg, inference_segments=None):
     """
     Perform inference on the test set and save features from different layers.
     Args:
         test_loader: DataLoader for the test set.
         model: SlowFast model.
         cfg: SlowFast configuration object.
+        inference_segments: List of segments with both therapist ratings
     """
     # Define layers to extract features from
     layers_to_extract = {
@@ -465,6 +496,11 @@ def perform_inference(test_loader, model, cfg):
             hook_handles.append(layers['slow'].register_forward_hook(get_activation(f"{depth}_slow")))
             hook_handles.append(layers['fast'].register_forward_hook(get_activation(f"{depth}_fast")))
     
+    # Create mapping from video_id to inference segment for quick lookup
+    inference_map = {}
+    if inference_segments:
+        inference_map = {seg['video_id']: seg for seg in inference_segments}
+    
     # Track class predictions and their confidences
     predictions = []
     device = next(model.parameters()).device
@@ -494,16 +530,42 @@ def perform_inference(test_loader, model, cfg):
                 sample_id = video_ids[i]
                 pred_class = torch.argmax(preds[i]).item()
                 confidence = torch.softmax(preds[i:i+1], dim=1)[0, pred_class].item()
-                true_class = labels[i].item()
                 
-                # Store prediction
-                predictions.append({
-                    'video_id': sample_id,
-                    'predicted': pred_class,
-                    'true': true_class,
-                    'confidence': confidence,
-                    'correct': pred_class == true_class
-                })
+                # Get therapist ratings if available in inference_map
+                if sample_id in inference_map:
+                    segment = inference_map[sample_id]
+                    t1_label = segment.get('t1_label')
+                    t2_label = segment.get('t2_label')
+                    
+                    # Check if prediction matches either therapist rating
+                    matches_t1 = (t1_label is not None) and (pred_class == t1_label)
+                    matches_t2 = (t2_label is not None) and (pred_class == t2_label)
+                    
+                    # Consider correct if matches either rating
+                    is_correct = matches_t1 or matches_t2
+                    
+                    # Store prediction with therapist rating info
+                    predictions.append({
+                        'video_id': sample_id,
+                        'predicted': pred_class,
+                        't1_label': t1_label,
+                        't2_label': t2_label,
+                        'confidence': confidence,
+                        'correct': is_correct,
+                        'matches_t1': matches_t1,
+                        'matches_t2': matches_t2,
+                        'matches_both': matches_t1 and matches_t2
+                    })
+                else:
+                    # Fall back to dataset label if no therapist ratings available
+                    true_class = labels[i].item()
+                    predictions.append({
+                        'video_id': sample_id,
+                        'predicted': pred_class,
+                        'true': true_class,
+                        'confidence': confidence,
+                        'correct': pred_class == true_class
+                    })
                 
                 # Save features if enabled
                 if SAVE_HEATMAPS_FEATURES:
@@ -527,7 +589,7 @@ def perform_inference(test_loader, model, cfg):
                                     'slow': slow_feat,
                                     'fast': fast_feat,
                                     'video_id': sample_id,
-                                    'label': true_class,
+                                    'label': t1_label if 't1_label' in locals() else true_class,
                                     'prediction': pred_class,
                                     'confidence': confidence,
                                 }
@@ -567,10 +629,53 @@ def perform_inference(test_loader, model, cfg):
             accuracy = sum(p['correct'] for p in predictions) / len(predictions)
             logger.info(f"Test accuracy: {accuracy:.4f} ({len(predictions)}/{total_samples} samples processed)")
             
-            # Log detailed metrics by class
+            # Calculate therapist agreement statistics if available
+            therapist_stats = {
+                't1_available': 0,
+                't2_available': 0,
+                't1_matches': 0,
+                't2_matches': 0,
+                'both_match': 0,
+                'either_match': 0
+            }
+            
+            for p in predictions:
+                if 't1_label' in p and p['t1_label'] is not None:
+                    therapist_stats['t1_available'] += 1
+                    if p['matches_t1']:
+                        therapist_stats['t1_matches'] += 1
+                        
+                if 't2_label' in p and p['t2_label'] is not None:
+                    therapist_stats['t2_available'] += 1
+                    if p['matches_t2']:
+                        therapist_stats['t2_matches'] += 1
+                
+                if 't1_label' in p and 't2_label' in p and p['t1_label'] is not None and p['t2_label'] is not None:
+                    if p['matches_both']:
+                        therapist_stats['both_match'] += 1
+                    if p['matches_t1'] or p['matches_t2']:
+                        therapist_stats['either_match'] += 1
+            
+            # Print therapist agreement statistics
+            if therapist_stats['t1_available'] > 0:
+                t1_acc = therapist_stats['t1_matches'] / therapist_stats['t1_available']
+                logger.info(f"Agreement with T1: {therapist_stats['t1_matches']}/{therapist_stats['t1_available']} ({t1_acc:.4f})")
+            
+            if therapist_stats['t2_available'] > 0:
+                t2_acc = therapist_stats['t2_matches'] / therapist_stats['t2_available']
+                logger.info(f"Agreement with T2: {therapist_stats['t2_matches']}/{therapist_stats['t2_available']} ({t2_acc:.4f})")
+            
+            # Calculate per-class metrics
             class_metrics = {}
             for p in predictions:
-                true_class = p['true']
+                # Determine true class - prioritize t1_label if available
+                if 't1_label' in p and p['t1_label'] is not None:
+                    true_class = p['t1_label']
+                elif 't2_label' in p and p['t2_label'] is not None:
+                    true_class = p['t2_label']
+                else:
+                    true_class = p.get('true')
+                
                 if true_class not in class_metrics:
                     class_metrics[true_class] = {'total': 0, 'correct': 0}
                 class_metrics[true_class]['total'] += 1
@@ -583,7 +688,90 @@ def perform_inference(test_loader, model, cfg):
                 
     except Exception as e:
         logger.error(f"Error saving prediction summary: {e}")
+        
+    # Add segment-based accuracy analysis
+    try:
+        # Extract segment IDs from video IDs
+        for p in predictions:
+            # Extract segment ID (assuming format ends with "_seg_X")
+            video_parts = p['video_id'].split('_seg_')
+            if len(video_parts) > 1:
+                p['segment_id'] = int(video_parts[1])  # Convert to integer for sorting
+            else:
+                p['segment_id'] = -1  # Default if no segment ID found
 
+        # Group predictions by segment ID
+        segment_results = {}
+        for p in predictions:
+            seg_id = p['segment_id']
+            if seg_id not in segment_results:
+                segment_results[seg_id] = {
+                    0: {'correct': 0, 'total': 0, 'accuracy': 0.0},
+                    1: {'correct': 0, 'total': 0, 'accuracy': 0.0}
+                }
+            
+            # Determine true class for this prediction
+            if 't1_label' in p and p['t1_label'] is not None:
+                true_class = p['t1_label']
+            elif 't2_label' in p and p['t2_label'] is not None:
+                true_class = p['t2_label']
+            else:
+                true_class = p.get('true')
+            
+            # Update counts for this class
+            if true_class in segment_results[seg_id]:
+                segment_results[seg_id][true_class]['total'] += 1
+                if p['correct']:
+                    segment_results[seg_id][true_class]['correct'] += 1
+        
+        # Calculate accuracy for each segment and class
+        for seg_id, classes in segment_results.items():
+            for class_id, stats in classes.items():
+                if stats['total'] > 0:
+                    stats['accuracy'] = stats['correct'] / stats['total'] * 100
+        
+        # Create a DataFrame for better visualization
+        import pandas as pd
+        
+        # Prepare data for DataFrame
+        data = []
+        for seg_id, classes in sorted(segment_results.items()):
+            row = {
+                'Segment ID': seg_id,
+                'Class 0 Correct': classes[0]['correct'],
+                'Class 0 Total': classes[0]['total'],
+                'Class 0 Accuracy (%)': f"{classes[0]['accuracy']:.1f}",
+                'Class 1 Correct': classes[1]['correct'],
+                'Class 1 Total': classes[1]['total'],
+                'Class 1 Accuracy (%)': f"{classes[1]['accuracy']:.1f}"
+            }
+            data.append(row)
+        
+        # Create DataFrame
+        segment_df = pd.DataFrame(data)
+        
+        # Save to CSV
+        segment_df.to_csv(os.path.join(cfg.OUTPUT_DIR, "segment_accuracy.csv"), index=False)
+        logger.info(f"Saved segment-based accuracy report to {os.path.join(cfg.OUTPUT_DIR, 'segment_accuracy.csv')}")
+        
+        # Print summary of segments with problematic accuracy
+        problem_segments = []
+        for row in data:
+            for class_id in [0, 1]:
+                if row[f'Class {class_id} Total'] > 0 and float(row[f'Class {class_id} Accuracy (%)']) < 50:
+                    problem_segments.append((row['Segment ID'], class_id, row[f'Class {class_id} Accuracy (%)']))
+        
+        if problem_segments:
+            logger.info("Segments with accuracy below 50%:")
+            for seg_id, class_id, accuracy in problem_segments:
+                logger.info(f"  Segment {seg_id}, Class {class_id}: {accuracy}%")
+        else:
+            logger.info("All segments have accuracy above 50% for both classes")
+            
+    except Exception as e:
+        logger.error(f"Error generating segment-based accuracy report: {e}")
+        import traceback
+        logger.error(traceback.format_exc())   
 
 def train(cfg, train_loader, val_loader, model):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -624,7 +812,7 @@ def train(cfg, train_loader, val_loader, model):
     scaler = GradScaler()
     
     # Training configuration
-    num_epochs = 10
+    num_epochs = 15
     best_val_acc = 0.0
     patience = 5  # Early stopping patience
     patience_counter = 0
@@ -790,7 +978,10 @@ def train(cfg, train_loader, val_loader, model):
     plt.close()
     
     # Load best model for return
-    best_checkpoint = torch.load(os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_balanced_weight_top_86.pt"))
+    if camera_box=='bboxes_top':
+        best_checkpoint = torch.load(os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_balanced_weight_top_86.pt"))
+    else:
+        best_checkpoint = torch.load(os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_best.pt"))
     model.load_state_dict(best_checkpoint['state_dict'])
     logger.info(f"Loaded best model with validation accuracy: {best_checkpoint['best_val_acc']:.2f}%")
     
@@ -832,7 +1023,93 @@ def create_balanced_sampler(train_segments):
     
     logger.info(f"Created balanced sampler with class distribution: {class_count}")
     return sampler
-
+# Modified code to check if ratings from t1 and t2 match
+def get_valid_rating(segment):
+    """
+    Get a valid rating only if t1 and t2 agree, or use the one that's available.
+    Returns the rating if valid, or None if invalid.
+    """
+    t1_rating = segment['segment_ratings'].get('t1', None)
+    t2_rating = segment['segment_ratings'].get('t2', None)
+    
+    # Try to convert ratings to integers
+    try:
+        t1_rating = int(t1_rating) if t1_rating is not None else None
+    except (ValueError, TypeError):
+        t1_rating = None
+        
+    try:
+        t2_rating = int(t2_rating) if t2_rating is not None else None
+    except (ValueError, TypeError):
+        t2_rating = None
+    
+    # Decision logic
+    if t1_rating is not None and t2_rating is not None:
+        # Both ratings available - check if they match
+        if t1_rating == t2_rating:
+            return t1_rating  # They match, use either one
+        else:
+            return 'no_match'  # They don't match, invalid rating
+    elif t1_rating is not None:
+        # Only t1 is available
+        return t1_rating
+    elif t2_rating is not None:
+        # Only t2 is available
+        return t2_rating
+    else:
+        # No valid ratings
+        return None
+def perform_inference_fold(val_loader, model, fold_num):
+    """
+    Simplified inference function for fold validation.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    predictions = []
+    total_samples = len(val_loader.dataset)
+    processed = 0
+    
+    with torch.no_grad():
+        for inputs, video_ids, _, _, labels in val_loader:
+            batch_size = len(video_ids)
+            processed += batch_size
+            
+            # Move to device
+            inputs = [inp.to(device) for inp in inputs]
+            labels = labels.to(device)
+            
+            # Get predictions
+            outputs, _ = model(inputs)
+            
+            # Process each prediction
+            for i in range(batch_size):
+                pred = torch.argmax(outputs[i]).item()
+                true = labels[i].item()
+                predictions.append({
+                    'video_id': video_ids[i],
+                    'predicted': pred,
+                    'true': true,
+                    'correct': pred == true
+                })
+    
+    # Calculate accuracy
+    accuracy = sum(p['correct'] for p in predictions) / len(predictions)
+    
+    # Calculate per-class metrics
+    class_metrics = {}
+    for p in predictions:
+        true_class = p['true']
+        if true_class not in class_metrics:
+            class_metrics[true_class] = {'total': 0, 'correct': 0}
+        class_metrics[true_class]['total'] += 1
+        class_metrics[true_class]['correct'] += 1 if p['correct'] else 0
+    
+    # Return results
+    return {
+        'accuracy': accuracy,
+        'class_metrics': class_metrics,
+        'predictions': predictions
+    }    
 def test(cfg):
     """
     Main function to fine-tune the SlowFast model and perform inference.
@@ -851,14 +1128,17 @@ def test(cfg):
     # Build and initialize the model
     model = build_model(cfg)
     model = model.to(device)
+
     if du.is_master_proc() and cfg.LOG_MODEL_INFO:
         misc.log_model_info(model, cfg, use_train_input=False)
     
     # Check if we're using a pre-trained fine-tuned model or doing fine-tuning
     if USE_PRETRAINED_FINETUNED:
         # Path to the fine-tuned model
-        finetuned_model_path = os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_balanced_weight_top_86.pt")
-        
+        if camera_box=='bboxes_top':
+            finetuned_model_path = os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_balanced_weight_top_86.pt")
+        else:
+            finetuned_model_path = os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_best.pt")        
         if os.path.exists(finetuned_model_path):
             logger.info(f"Loading fine-tuned model from {finetuned_model_path}")
             # First load the pre-trained weights
@@ -898,15 +1178,25 @@ def test(cfg):
         cu.load_test_checkpoint(cfg, model)
 
     # Define paths
-    pickle_dir = "D:/pickle_dir/fine_tune"
-    bbox_dir = "D:/frcnn_bboxes/bboxes_top"
+    # if USE_PRETRAINED_FINETUNED==1:
+    #     pickle_dir = "D:/pickle_dir"
+    # else:
+    pickle_dir = "D:/pickle_dir"
+    bbox_dir = "D:/frcnn_bboxes/"+camera_box
     pickle_files = glob.glob(os.path.join(pickle_dir, '*.pkl'))
-
+    # Read the CSV file
+    camera_df = pd.read_csv(ipsi_contra_csv)
+    # Create a dictionary mapping patient_id to ipsilateral_camera_id
+    patient_to_ipsilateral = dict(zip(camera_df['patient_id'], camera_df['ipsilateral_camera_id']))
     logger.info(f"Found {len(pickle_files)} pickle files to process.")
     logger.info("----------------------------------------------------------")
 
     # Collect all_segments as before...
     all_segments = []
+    inference_segments=[]
+    r1=0
+    no_match=0
+    r3=0
     for pkl_file in tqdm(pickle_files, desc="Collecting segments"):
         try:
             with open(pkl_file, 'rb') as f:
@@ -916,133 +1206,303 @@ def test(cfg):
             continue
 
         for camera_id in data:
-            if camera_id == 'cam3':
-                for segments_group in data[camera_id]:
-                    for segment in segments_group:
+            for segments_group in data[camera_id]:
+                for segment in segments_group:
+                    # Extract patient_id and camera_id from segment
+                    patient_id = segment['patient_id']
+                    segment_camera_id = segment['CameraId']
+                    # Check if this camera is the ipsilateral camera for the patient
+                    if camera_id=='cam3' and camera_box=='bboxes_top':
+                        ipsilateral_camera=camera_id
+                    elif camera_id!='cam3' and camera_box=='bboxes_ipsi':
+                        ipsilateral_camera = patient_to_ipsilateral.get(patient_id)
+                    else:
+                        continue
+                    if ipsilateral_camera == segment_camera_id:
                         if 'segment_ratings' not in segment:
                             logger.warning(f"Skipping segment in {pkl_file} with missing 'segment_ratings'")
                             continue
-                        rating = segment['segment_ratings'].get('t1', None)
+                        rating = get_valid_rating(segment)
+                        t1_rating = segment['segment_ratings'].get('t1', None)
+                        t2_rating = segment['segment_ratings'].get('t2', None)
+                        if rating is None or rating not in [2, 3,"no_match"]:
+                            continue
+                        else:
+                            t1_label = None if t1_rating is None else (0 if t1_rating == 2 else 1)
+                            t2_label = None if t2_rating is None else (0 if t2_rating == 2 else 1)
+                            video_id = (f"patient_{segment['patient_id']}_task_{segment['activity_id']}_"
+                                        f"{segment['CameraId']}_seg_{segment['segment_id']}")
+                            inference_segments.append({
+                                'frames': segment['frames'],
+                                'video_id': video_id,
+                                't1_label':t1_label,
+                                't2_label':t2_label,
+                                'hand_id': ipsilateral_camera
+                                                    })                        
+
                         try:
-                            rating = int(rating)
-                            if rating not in [2, 3]:
+                            if rating =="no_match":
+                                no_match+=1
                                 continue
-                            label = 0 if rating == 2 else 1  # Map 2 -> 0, 3 -> 1
+                            rating = int(rating)
+                            
+                            # Map according to specified scheme: 1->0, 2->1, 3->2
+                            if rating == 2:
+                                label = 0      # Class 0 for rating 1
+                                r1+=1
+                            else:  # rating == 3
+                                label = 1     # Class 2 for rating 3
+                                r3+=1
                         except (ValueError, TypeError):
                             logger.warning(f"Skipping segment in {pkl_file} with invalid rating: {rating}")
                             continue
-                        video_id = (f"patient_{segment['patient_id']}_task_{segment['activity_id']}_"
-                                    f"{segment['CameraId']}_seg_{segment['segment_id']}")
                         all_segments.append({
                             'frames': segment['frames'],
                             'video_id': video_id,
-                            'label': label
+                            'label': label,
+                            'hand_id': ipsilateral_camera
                         })
 
     # If we're using a pre-trained model, use all data for inference
     # Otherwise, split for training
     if USE_PRETRAINED_FINETUNED:
-        logger.info(f"Using all {len(all_segments)} segments for inference with pre-trained model")
-        inference_segments = all_segments
-        train_segments = []  # Empty, not used
-    else:
-        # Split into train/validation sets
-        train_segments, inference_segments = train_test_split(
-            all_segments, test_size=0.2, random_state=42
-        )
-        logger.info(f"Train/Val split: {len(train_segments)}/{len(inference_segments)} segments")
-
-    # ─── Create Datasets ────────────────────────────────────────────────────────
-    # Only create training datasets if we're going to fine-tune
-    if not USE_PRETRAINED_FINETUNED:
-        train_datasets = [
+        logger.info(f"Using all {len(inference_segments)} segments for inference with pre-trained model")
+        
+        # Create dataset from inference_segments
+        inference_datasets = [
             SinglePickleFrameDataset(
                 frames=seg["frames"],
                 video_id=seg["video_id"],
-                label=seg["label"],
+                label=seg.get("t1_label", 0),  # Use t1_label as primary label
+                camera_id=seg['hand_id'],
                 cfg=cfg,
                 bbox_dir=bbox_dir,
-                is_train=True
+                is_train=False
             )
-            for seg in train_segments
+            for seg in inference_segments
         ]
-    else:
-        train_datasets = []  # Empty list, not used
-
-    # Always create inference datasets
-    inference_datasets = [
-        SinglePickleFrameDataset(
-            frames=seg["frames"],
-            video_id=seg["video_id"],
-            label=seg["label"],
-            cfg=cfg,
-            bbox_dir=bbox_dir,
-            is_train=False
-        )
-        for seg in inference_segments
-    ]
-
-    # After creating all datasets, save the list of missing bounding box files
-    if hasattr(SinglePickleFrameDataset, 'missing_bbox_files') and SinglePickleFrameDataset.missing_bbox_files:
-        missing_files_path = os.path.join(cfg.OUTPUT_DIR, "missing_bbox_files.txt")
-        with open(missing_files_path, 'w') as f:
-            for file in set(SinglePickleFrameDataset.missing_bbox_files):  # Use set to remove duplicates
-                f.write(f"{file}\n")
-        logger.info(f"Saved list of {len(set(SinglePickleFrameDataset.missing_bbox_files))} missing bounding box files to {missing_files_path}")
-    
-    # ─── DataLoaders with custom collate_fn ─────────────────────────────────────
-    # Only create training dataloader if we're fine-tuning
-    if not USE_PRETRAINED_FINETUNED:
-        if BALANCED_SAMPLING:
-            # Create balanced sampler for training
-            train_sampler = create_balanced_sampler(train_segments)
-            
-            # Use the sampler in the training DataLoader
-            train_loader = torch.utils.data.DataLoader(
-                torch.utils.data.ConcatDataset(train_datasets),
-                batch_size=4,
-                sampler=train_sampler,  # Use the sampler instead of shuffle
-                shuffle=False,  # Must be False when using a sampler
-                num_workers=0,
-                pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
-                drop_last=False,
-                collate_fn=fastslow_collate_fn,
-            )
-            logger.info("Using balanced sampling for training batches")
-        else:
-            # Original DataLoader with shuffling
-            train_loader = torch.utils.data.DataLoader(
-                torch.utils.data.ConcatDataset(train_datasets),
-                batch_size=4,
-                shuffle=True,
-                num_workers=0,
-                pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
-                drop_last=False,
-                collate_fn=fastslow_collate_fn,
-            )
-            logger.info("Using standard random sampling for training batches")
-    else:
-        train_loader = None  # Not used
-
-    # Always create inference dataloader
-    inference_loader = torch.utils.data.DataLoader(
-        torch.utils.data.ConcatDataset(inference_datasets),
-        batch_size=4,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
-        drop_last=False,
-        collate_fn=fastslow_collate_fn,
-    )
-
-    # Fine‑tune & inference - only do fine-tuning if not using pre-trained model
-    if not USE_PRETRAINED_FINETUNED:
-        logger.info("Starting fine-tuning process...")
-        model = train(cfg, train_loader, inference_loader, model)
         
-    # Run inference
-    logger.info("Starting inference process...")
-    perform_inference(inference_loader, model, cfg)
+        # Create inference dataloader
+        inference_loader = torch.utils.data.DataLoader(
+            torch.utils.data.ConcatDataset(inference_datasets),
+            batch_size=4,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
+            drop_last=False,
+            collate_fn=fastslow_collate_fn,
+        )
+        
+        # Run inference using the pre-trained model
+        logger.info("Starting inference process...")
+        perform_inference(inference_loader, model, cfg, inference_segments)
+    else:
+        # Implement 5-fold cross-validation using all_segments
+        from sklearn.model_selection import KFold
+        
+        # Set up 5-fold cross-validation
+        k_folds = 5
+        kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+        
+        # Track best model across folds
+        best_val_acc = 0.0
+        best_model_state = None
+        best_fold = -1
+        fold_results = []
+        
+        # Create a mapping from video_id to segment
+        segment_map = {seg['video_id']: seg for seg in all_segments}
+        
+        # Loop through each fold
+        for fold, (train_idx, val_idx) in enumerate(kf.split(all_segments)):
+            logger.info(f"Starting fold {fold+1}/{k_folds}")
+            
+            # Split the data for this fold - use indices to avoid data leakage
+            train_segments = [all_segments[i] for i in train_idx]
+            val_segments = [all_segments[i] for i in val_idx]
+            
+            # Calculate split percentages
+            train_pct = len(train_segments) / len(all_segments) * 100
+            val_pct = len(val_segments) / len(all_segments) * 100
+            logger.info(f"Fold {fold+1} split: {len(train_segments)} ({train_pct:.1f}%) train, "
+                        f"{len(val_segments)} ({val_pct:.1f}%) validation")
+            
+            # Create datasets for this fold
+            train_datasets = [
+                SinglePickleFrameDataset(
+                    frames=seg["frames"],
+                    video_id=seg["video_id"],
+                    label=seg["label"],
+                    camera_id=seg['hand_id'],
+                    cfg=cfg,
+                    bbox_dir=bbox_dir,
+                    is_train=True
+                )
+                for seg in train_segments
+            ]
+            
+            val_datasets = [
+                SinglePickleFrameDataset(
+                    frames=seg["frames"],
+                    video_id=seg["video_id"],
+                    label=seg["label"],
+                    camera_id=seg['hand_id'],
+                    cfg=cfg,
+                    bbox_dir=bbox_dir,
+                    is_train=False
+                )
+                for seg in val_segments
+            ]
+            
+            # Create dataloaders
+            if BALANCED_SAMPLING:
+                train_sampler = create_balanced_sampler(train_segments)
+                train_loader = torch.utils.data.DataLoader(
+                    torch.utils.data.ConcatDataset(train_datasets),
+                    batch_size=4,
+                    sampler=train_sampler,
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
+                    drop_last=False,
+                    collate_fn=fastslow_collate_fn,
+                )
+            else:
+                train_loader = torch.utils.data.DataLoader(
+                    torch.utils.data.ConcatDataset(train_datasets),
+                    batch_size=4,
+                    shuffle=True,
+                    num_workers=0,
+                    pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
+                    drop_last=False,
+                    collate_fn=fastslow_collate_fn,
+                )
+            
+            val_loader = torch.utils.data.DataLoader(
+                torch.utils.data.ConcatDataset(val_datasets),
+                batch_size=4,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
+                drop_last=False,
+                collate_fn=fastslow_collate_fn,
+            )
+            
+            # Reset the model for this fold
+            fold_model = build_model(cfg)
+            fold_model = fold_model.to(device)
+            cu.load_test_checkpoint(cfg, fold_model)
+            
+            # Train the model for this fold
+            logger.info(f"Training model for fold {fold+1}")
+            fold_model = train(cfg, train_loader, val_loader, fold_model)
+            
+            # Save fold model
+            fold_dir = os.path.join(cfg.OUTPUT_DIR, f"fold_{fold+1}")
+            os.makedirs(fold_dir, exist_ok=True)
+            torch.save({
+                'fold': fold+1,
+                'state_dict': fold_model.state_dict(),
+            }, os.path.join(fold_dir, "fold_model.pt"))
+            
+            # Evaluate on validation set
+            logger.info(f"Evaluating model for fold {fold+1}")
+            
+            # Perform inference on validation set
+            val_results = perform_inference_fold(val_loader, fold_model, fold+1)
+            fold_acc = val_results['accuracy']
+            
+            # Store fold results
+            fold_results.append({
+                'fold': fold+1,
+                'accuracy': fold_acc,
+                'class_metrics': val_results['class_metrics']
+            })
+            
+            logger.info(f"Fold {fold+1} validation accuracy: {fold_acc:.4f}")
+            
+            # Track best model
+            if fold_acc > best_val_acc:
+                best_val_acc = fold_acc
+                best_model_state = fold_model.state_dict()
+                best_fold = fold+1
+                
+                # Save as best model
+                torch.save({
+                    'fold': fold+1,
+                    'state_dict': fold_model.state_dict(),
+                    'accuracy': fold_acc
+                }, os.path.join(cfg.OUTPUT_DIR, "best_fold_model.pt"))
+        
+        # After all folds, print summary
+        logger.info("Cross-validation complete. Summary of fold results:")
+        fold_accs = [fold["accuracy"] for fold in fold_results]
+        mean_acc = sum(fold_accs) / len(fold_accs)
+        std_acc = (sum((acc - mean_acc) ** 2 for acc in fold_accs) / len(fold_accs)) ** 0.5
+        
+        logger.info(f"Mean accuracy across folds: {mean_acc:.4f} ± {std_acc:.4f}")
+        logger.info(f"Best fold: {best_fold} with accuracy {best_val_acc:.4f}")
+        
+        # Final evaluation using best model on all inference_segments
+        logger.info(f"Using best model from fold {best_fold} for final inference")
+        
+
+        # First load the pre-trained weights
+        cu.load_test_checkpoint(cfg, model)
+        # Then prepare model head for 2 classes
+        model = modify_slowfast_head(model, num_classes=2, device=device)
+        best_model_path=os.path.join(cfg.OUTPUT_DIR, "best_fold_model.pt")
+        # Load the fine-tuned weights with error handling
+        try:
+            # Load checkpoint which contains state_dict
+            checkpoint = torch.load(best_model_path, map_location=device)
+            # Extract state_dict from the checkpoint
+            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+                logger.info("Successfully extracted state_dict from checkpoint")
+            else:
+                state_dict = checkpoint  # Assume it's directly the state_dict
+            
+            # Try loading with strict=False to allow partial loading
+            logger.info("Attempting to load best fold model weights")
+            model.load_state_dict(state_dict, strict=False)
+            logger.info("Successfully loaded fine-tuned weights")
+            
+            # Log validation accuracy if available
+            if isinstance(checkpoint, dict) and 'best_val_acc' in checkpoint:
+                logger.info(f"Loaded model with validation accuracy: {checkpoint['best_val_acc']:.2f}%")
+        except Exception as e:
+            logger.error(f"Error loading fine-tuned weights: {e}")
+            logger.info("Falling back to the pre-trained model with modified head")
+
+        # Create dataset from inference_segments for final evaluation
+        inference_datasets = [
+            SinglePickleFrameDataset(
+                frames=seg["frames"],
+                video_id=seg["video_id"],
+                label=seg.get("t1_label", 0),  # Use t1_label as primary label
+                camera_id=seg['hand_id'],
+                cfg=cfg,
+                bbox_dir=bbox_dir,
+                is_train=False
+            )
+            for seg in inference_segments
+        ]
+        
+        # Create inference dataloader
+        inference_loader = torch.utils.data.DataLoader(
+            torch.utils.data.ConcatDataset(inference_datasets),
+            batch_size=4,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=cfg.DATA_LOADER.PIN_MEMORY,
+            drop_last=False,
+            collate_fn=fastslow_collate_fn,
+        )
+        
+        # Run final inference
+        logger.info("Starting final inference with best model...")
+        perform_inference(inference_loader, model, cfg, inference_segments)
 
 def main():
     args = parse_args()
