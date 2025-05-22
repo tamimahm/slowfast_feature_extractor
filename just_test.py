@@ -4,13 +4,13 @@
 # Configuration flag: 
 # 0 = do fine-tuning and then testing
 # 1 = load saved fine-tuned model and run testing only
-USE_PRETRAINED_FINETUNED = 0  # Change this value to control the workflow
+USE_PRETRAINED_FINETUNED = 1  # Change this value to control the workflow
 # Add this at the top of your code with other global flags
 CLASS_IMBALANCE = 1  # Set to 1 to enable class weight balancing, 0 for original approach
 # Add this at the top of your code with other global flags
 BALANCED_SAMPLING = 1  # Set to 1 to enable balanced batch sampling, 0 for original approach
 # Add this at the top of your code with other global flags
-SAVE_HEATMAPS_FEATURES = 0  # Set to 1 to save heatmaps and features, 0 to ignore
+SAVE_HEATMAPS_FEATURES = 1  # Set to 1 to save heatmaps and features, 0 to ignore
 import numpy as np
 import torch
 import os
@@ -27,6 +27,7 @@ from sklearn.model_selection import train_test_split
 from torch.cuda.amp import autocast, GradScaler
 import pandas as pd
 
+from skimage.transform import resize
 # Suppress specific warnings from torchvision
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.transforms._transforms_video")
 
@@ -43,7 +44,7 @@ from models import build_model
 logger = logging.get_logger(__name__)
 # Path to the CSV file with camera assignments
 ipsi_contra_csv = "D:\\Github\\Multi_view-automatic-assessment\\camera_assignments.csv"
-camera_box="bboxes_top"
+camera_box="bboxes_ipsi"
 def load_bboxes(bbox_dir, video_id):
     """
     Load bounding box data for a video segment.
@@ -164,7 +165,7 @@ class SinglePickleFrameDataset(torch.utils.data.Dataset):
                     # plt.imshow(frame[y_min:y_max_ext, x_min:x_max])
                     # plt.title("Cropped Frame")
                     # plt.axis('off')
-                    plt.show()
+                    #plt.show()
             if x_max <= x_min or y_max_ext <= y_min:
                 return frame
             return frame[y_min:y_max_ext, x_min:x_max]
@@ -470,10 +471,7 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
     # Create directories for feature outputs
     if SAVE_HEATMAPS_FEATURES:
         for depth in layers_to_extract:
-            os.makedirs(os.path.join(cfg.OUTPUT_DIR, f"features_{depth}"), exist_ok=True)
-    
-    # Create a directory for final features
-    os.makedirs(os.path.join(cfg.OUTPUT_DIR, "features"), exist_ok=True)
+            os.makedirs(os.path.join(cfg.OUTPUT_DIR, f"features_{camera_box.split('_')[1]}", f"features_{depth}"), exist_ok=True)
     
     # Create hooks to capture intermediate layer features
     activation = {}
@@ -509,11 +507,74 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
     total_samples = len(test_loader.dataset)
     processed_samples = 0
     
+    # Setup for task buffering across batches
+    # Expected segment IDs
+    SEG_SET = {0, 1, 2, 3}
+    
+    # Initialize task buffers for each depth
+    task_buffers = {depth: {} for depth in layers_to_extract}
+    
+    # Track how many batches a task has been waiting
+    batch_counts = {depth: {} for depth in layers_to_extract}
+    
+    # Configuration for segment processing
+    min_segments_required = 4  # Minimum segments needed to process a task
+    max_wait_batches = 10      # Maximum batches to wait before flushing incomplete tasks
+    
+    # Function to flush task segments to disk with improved robustness
+    def flush_task(depth, task_key, save_dir, force=False):
+        """
+        Concatenate available segments and save to disk.
+        
+        Args:
+            depth: Feature depth (low, mid, deep)
+            task_key: Task identifier (patient_X_task_Y_camZ)
+            save_dir: Directory to save features to
+            force: Whether to force flushing even if not all segments are available
+            
+        Returns:
+            Boolean indicating if the task was flushed
+        """
+        if task_key not in task_buffers[depth]:
+            return False
+            
+        seg_dict = task_buffers[depth][task_key]
+        available_segments = set(seg_dict.keys())
+        
+        # Check if all expected segments are available or if we should force flush
+        if SEG_SET.issubset(available_segments) or (force and len(available_segments) >= min_segments_required):
+            # Order the available segments
+            available_segs = sorted(available_segments)
+            seg_order = [seg_dict[k] for k in available_segs]
+            
+            # Concatenate available segments
+            task_feat = np.concatenate(seg_order, axis=1)
+            
+            # Save the concatenated feature
+            out_path = os.path.join(save_dir, f"{task_key}_taskfeat.npy")
+            np.save(out_path, task_feat.astype(np.float32))
+            
+            # Log which segments were included
+            seg_str = ','.join([str(s) for s in available_segs])
+            logger.info(f"[{depth}] saved {os.path.basename(out_path)} with segments {seg_str}")
+            
+            # Remove the task from buffers
+            task_buffers[depth].pop(task_key)
+            if task_key in batch_counts[depth]:
+                batch_counts[depth].pop(task_key)
+                
+            return True
+        
+        return False
+    
+    # Process each batch
+    batch_counter = 0
     for inputs, video_ids, slow_frames, fast_frames, labels in test_loader:
         batch_size = labels.size(0)  # Get current batch size
         processed_samples += batch_size
+        batch_counter += 1
         
-        logger.info(f"Processing batch {processed_samples-batch_size+1}-{processed_samples}/{total_samples}")
+        logger.info(f"Processing batch {batch_counter} ({processed_samples-batch_size+1}-{processed_samples}/{total_samples})")
         
         # Process inputs
         try:
@@ -569,13 +630,9 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
                 
                 # Save features if enabled
                 if SAVE_HEATMAPS_FEATURES:
-                    # Save final features
-                    sample_feat = feat[i:i+1].cpu().numpy()
-                    np.save(os.path.join(cfg.OUTPUT_DIR, "features", f"{sample_id}_final_features.npy"), sample_feat)
-                    
                     # Save intermediate features from each layer
                     for depth in layers_to_extract:
-                        features_dir = os.path.join(cfg.OUTPUT_DIR, f"features_{depth}")
+                        features_dir = os.path.join(cfg.OUTPUT_DIR, f"features_{camera_box.split('_')[1]}", f"features_{depth}")
                         
                         try:
                             # Check if the activations were captured
@@ -584,23 +641,70 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
                                 slow_feat = activation[f"{depth}_slow"][i].cpu().numpy()
                                 fast_feat = activation[f"{depth}_fast"][i].cpu().numpy()
                                 
-                                # Create feature dictionary
-                                feat_dict = {
-                                    'slow': slow_feat,
-                                    'fast': fast_feat,
-                                    'video_id': sample_id,
-                                    'label': t1_label if 't1_label' in locals() else true_class,
-                                    'prediction': pred_class,
-                                    'confidence': confidence,
-                                }
+                                # -----------------------------------------------------------
+                                # 1) spatial global‑average‑pool  (C, T, H, W) → (C, T)
+                                slow_2d = slow_feat.mean(axis=(2, 3))          # (256, 8)
+                                fast_2d = fast_feat.mean(axis=(2, 3))          # ( 32, 32)
+
+                                # -----------------------------------------------------------
+                                # 2) resample each pathway along time so BOTH => T = 20
+                                def resample_to_20(arr):
+                                    C, T = arr.shape
+                                    # skimage.resize expects (T,) per channel so transpose twice
+                                    return resize(arr.T, (20, C), mode="reflect", order=1,
+                                                anti_aliasing=False, preserve_range=True).T  # (C,20)
+
+                                slow_20 = resample_to_20(slow_2d)          # (256, 20)
+                                fast_20 = resample_to_20(fast_2d)          # ( 32, 20)
+
+                                # -----------------------------------------------------------
+                                # 3) concat channels and save
+                                clip_feat = np.concatenate([slow_20, fast_20], axis=0)   # (288,20)    
                                 
-                                # Save as pickle file
-                                with open(os.path.join(features_dir, f"{sample_id}_{depth}_features.pkl"), 'wb') as f:
-                                    pickle.dump(feat_dict, f)
-                                
-                                logger.info(f"Saved {depth} features for {sample_id}")
+                                # Parse video ID to get task and segment info
+                                try:
+                                    video_id = video_ids[i]
+                                    parts = video_id.split('_')
+                                    # Ensure format is consistent: patient_X_task_Y_camZ_seg_N
+                                    if len(parts) >= 6 and parts[-2] == "seg":
+                                        task_key = f"{parts[0]}_{parts[1]}_{parts[2]}_{parts[3]}"  # patient_X_task_Y_camZ
+                                        seg_id = int(parts[-1])  # Extract segment ID
+                                        
+                                        # Add segment to buffer for this task
+                                        if task_key not in task_buffers[depth]:
+                                            task_buffers[depth][task_key] = {}
+                                            batch_counts[depth][task_key] = 0
+                                        
+                                        task_buffers[depth][task_key][seg_id] = clip_feat
+                                        # Reset batch counter when a new segment arrives
+                                        batch_counts[depth][task_key] = 0
+                                        
+                                        # Try to flush if all segments are available
+                                        flush_task(depth, task_key, features_dir)
+                                        
+                                        logger.debug(f"Added segment {seg_id} for task {task_key} (depth: {depth})")
+                                    else:
+                                        logger.warning(f"Unexpected video ID format: {video_id}")
+                                except Exception as e:
+                                    logger.error(f"Error parsing video ID {video_id}: {e}")
                         except Exception as e:
                             logger.error(f"Error saving {depth} features for {sample_id}: {e}")
+            
+            # After processing the batch, increment the wait counter for each task
+            # and check if any task should be force-flushed
+            for depth in layers_to_extract:
+                for task_key in list(task_buffers[depth].keys()):
+                    if task_key in batch_counts[depth]:
+                        batch_counts[depth][task_key] += 1
+                        
+                        # Force flush tasks that have waited too long
+                        if batch_counts[depth][task_key] >= max_wait_batches:
+                            features_dir = os.path.join(cfg.OUTPUT_DIR, 
+                                                  f"features_{camera_box.split('_')[1]}", 
+                                                  f"features_{depth}")
+                            
+                            if flush_task(depth, task_key, features_dir, force=True):
+                                logger.info(f"Forced flush of {task_key} after {batch_counts[depth][task_key]} batches")
             
         except Exception as e:
             logger.error(f"Error processing batch: {e}")
@@ -614,6 +718,17 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
         # Clear activations after processing the batch
         activation.clear()
         torch.cuda.empty_cache()
+    
+    # At the end, flush any remaining tasks (with whatever segments are available)
+    logger.info("Processing complete. Flushing any remaining tasks...")
+    for depth in layers_to_extract:
+        for task_key in list(task_buffers[depth].keys()):
+            features_dir = os.path.join(cfg.OUTPUT_DIR, 
+                              f"features_{camera_box.split('_')[1]}", 
+                              f"features_{depth}")
+            
+            if flush_task(depth, task_key, features_dir, force=True):
+                logger.info(f"Final forced flush of task {task_key}")
     
     # Clean up hooks if they were registered
     for handle in hook_handles:
@@ -771,7 +886,9 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
     except Exception as e:
         logger.error(f"Error generating segment-based accuracy report: {e}")
         import traceback
-        logger.error(traceback.format_exc())   
+        logger.error(traceback.format_exc())
+        
+    return predictions
 
 def train(cfg, train_loader, val_loader, model):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1136,9 +1253,9 @@ def test(cfg):
     if USE_PRETRAINED_FINETUNED:
         # Path to the fine-tuned model
         if camera_box=='bboxes_top':
-            finetuned_model_path = os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_balanced_weight_top_86.pt")
+            finetuned_model_path = os.path.join(cfg.OUTPUT_DIR,'final_top_run', "best_fold_model.pt")
         else:
-            finetuned_model_path = os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_best.pt")        
+            finetuned_model_path = os.path.join(cfg.OUTPUT_DIR, 'final_ipsi_run', "best_fold_model.pt")        
         if os.path.exists(finetuned_model_path):
             logger.info(f"Loading fine-tuned model from {finetuned_model_path}")
             # First load the pre-trained weights
