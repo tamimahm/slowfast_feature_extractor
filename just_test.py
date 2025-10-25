@@ -43,8 +43,9 @@ from models import build_model
 
 logger = logging.get_logger(__name__)
 # Path to the CSV file with camera assignments
-ipsi_contra_csv = "D:\\Github\\Multi_view-automatic-assessment\\camera_assignments.csv"
+ipsi_contra_csv = "D:\\nature_everything\\camera_assignments.csv"
 camera_box="bboxes_ipsi"
+_map = {1: 0, 2: 1, 3: 2}##########change this for the correct mapping
 def load_bboxes(bbox_dir, video_id):
     """
     Load bounding box data for a video segment.
@@ -1298,8 +1299,9 @@ def test(cfg):
     # if USE_PRETRAINED_FINETUNED==1:
     #     pickle_dir = "D:/pickle_dir"
     # else:
-    pickle_dir = "D:/pickle_dir"
-    bbox_dir = "D:/frcnn_bboxes/"+camera_box
+    ###########################################################################################change directory########################################################
+    pickle_dir = "D:/nature_everything/nature_dataset"
+    bbox_dir = "D:/nature_everything/frcnn_boxes"+camera_box
     pickle_files = glob.glob(os.path.join(pickle_dir, '*.pkl'))
     # Read the CSV file
     camera_df = pd.read_csv(ipsi_contra_csv)
@@ -1342,11 +1344,11 @@ def test(cfg):
                         rating = get_valid_rating(segment)
                         t1_rating = segment['segment_ratings'].get('t1', None)
                         t2_rating = segment['segment_ratings'].get('t2', None)
-                        if rating is None or rating not in [2, 3,"no_match"]:
+                        if rating is None or rating not in [1,2, 3,"no_match"]: ###########this needs to be changed to read 1,2,3
                             continue
                         else:
-                            t1_label = None if t1_rating is None else (0 if t1_rating == 2 else 1)
-                            t2_label = None if t2_rating is None else (0 if t2_rating == 2 else 1)
+                            t1_label = None if t1_rating is None else _map.get(t1_rating)
+                            t2_label = None if t2_rating is None else _map.get(t2_rating)
                             video_id = (f"patient_{segment['patient_id']}_task_{segment['activity_id']}_"
                                         f"{segment['CameraId']}_seg_{segment['segment_id']}")
                             inference_segments.append({
@@ -1363,13 +1365,15 @@ def test(cfg):
                                 continue
                             rating = int(rating)
                             
-                            # Map according to specified scheme: 1->0, 2->1, 3->2
-                            if rating == 2:
-                                label = 0      # Class 0 for rating 1
-                                r1+=1
-                            else:  # rating == 3
-                                label = 1     # Class 2 for rating 3
-                                r3+=1
+                            if rating == 1:
+                                label = 0
+                                r1 += 1
+                            elif rating == 2:
+                                label = 1
+                                r2 += 1
+                            else:
+                                label = 2
+                                r3 += 1
                         except (ValueError, TypeError):
                             logger.warning(f"Skipping segment in {pkl_file} with invalid rating: {rating}")
                             continue
