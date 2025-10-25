@@ -4,13 +4,14 @@
 # Configuration flag: 
 # 0 = do fine-tuning and then testing
 # 1 = load saved fine-tuned model and run testing only
-USE_PRETRAINED_FINETUNED = 1  # Change this value to control the workflow
+USE_PRETRAINED_FINETUNED = 0  # Change this value to control the workflow
 # Add this at the top of your code with other global flags
-CLASS_IMBALANCE = 1  # Set to 1 to enable class weight balancing, 0 for original approach
+CLASS_IMBALANCE = 0  # Set to 1 to enable class weight balancing, 0 for original approach
 # Add this at the top of your code with other global flags
 BALANCED_SAMPLING = 1  # Set to 1 to enable balanced batch sampling, 0 for original approach
 # Add this at the top of your code with other global flags
 SAVE_HEATMAPS_FEATURES = 1  # Set to 1 to save heatmaps and features, 0 to ignore
+num_class=3  ##########set this to the correct number fo classes 0,1,2
 import numpy as np
 import torch
 import os
@@ -894,7 +895,7 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
 def train(cfg, train_loader, val_loader, model):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    model = modify_slowfast_head(model, num_classes=2, device=device)
+    model = modify_slowfast_head(model, num_classes=num_class, device=device)
 
     # Freeze s1, s2, s3 layers
     for name, param in model.named_parameters():
@@ -1262,7 +1263,7 @@ def test(cfg):
             # First load the pre-trained weights
             cu.load_test_checkpoint(cfg, model)
             # Then prepare model head for 2 classes
-            model = modify_slowfast_head(model, num_classes=2, device=device)
+            model = modify_slowfast_head(model, num_classes=num_class, device=device)
             
             # Load the fine-tuned weights with error handling
             try:
@@ -1289,7 +1290,7 @@ def test(cfg):
         else:
             logger.warning(f"Fine-tuned model not found at {finetuned_model_path}. Loading default checkpoint.")
             cu.load_test_checkpoint(cfg, model)
-            model = modify_slowfast_head(model, num_classes=2, device=device)
+            model = modify_slowfast_head(model, num_classes=num_class, device=device)
     else:
         # Load the pre-trained weights for fine-tuning
         logger.info("Loading pre-trained weights for fine-tuning")
@@ -1314,6 +1315,7 @@ def test(cfg):
     all_segments = []
     inference_segments=[]
     r1=0
+    r2=0
     no_match=0
     r3=0
     for pkl_file in tqdm(pickle_files, desc="Collecting segments"):
@@ -1571,7 +1573,7 @@ def test(cfg):
         # First load the pre-trained weights
         cu.load_test_checkpoint(cfg, model)
         # Then prepare model head for 2 classes
-        model = modify_slowfast_head(model, num_classes=2, device=device)
+        model = modify_slowfast_head(model, num_classes=num_class, device=device)
         best_model_path=os.path.join(cfg.OUTPUT_DIR, "best_fold_model.pt")
         # Load the fine-tuned weights with error handling
         try:
