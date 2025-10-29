@@ -1302,7 +1302,7 @@ def test(cfg):
     # else:
     ###########################################################################################change directory########################################################
     pickle_dir = "D:/nature_everything/nature_dataset"
-    bbox_dir = "D:/nature_everything/frcnn_boxes"+camera_box
+    bbox_dir = "D:/nature_everything/frcnn_boxes/"+camera_box
     pickle_files = glob.glob(os.path.join(pickle_dir, '*.pkl'))
     # Read the CSV file
     camera_df = pd.read_csv(ipsi_contra_csv)
