@@ -2,9 +2,9 @@ import sys
 #from test_net import main  # Updated to import from test_net.py
 #from faster_rcnn_slowFast import main  # Updated to import from test_net.py
 #from faster_rcnn_slowfast_finetune import main
-from just_test import main
+#from just_test import main
 
-
+from task_slowfast import main
 from multiprocessing import freeze_support
 
 # Simulate command-line arguments
