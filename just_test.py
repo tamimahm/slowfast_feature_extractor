@@ -874,7 +874,7 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
         # Print summary of segments with problematic accuracy
         problem_segments = []
         for row in data:
-            for class_id in [0, 1]:
+            for class_id in [0, 1, 2]:
                 if row[f'Class {class_id} Total'] > 0 and float(row[f'Class {class_id} Accuracy (%)']) < 50:
                     problem_segments.append((row['Segment ID'], class_id, row[f'Class {class_id} Accuracy (%)']))
         
