@@ -6,7 +6,7 @@
 # 1 = load saved fine-tuned model and run testing only
 USE_PRETRAINED_FINETUNED = 0  # Change this value to control the workflow
 # Add this at the top of your code with other global flags
-CLASS_IMBALANCE = 0  # Set to 1 to enable class weight balancing, 0 for original approach
+CLASS_IMBALANCE = 1  # Set to 1 to enable class weight balancing, 0 for original approach
 # Add this at the top of your code with other global flags
 BALANCED_SAMPLING = 1  # Set to 1 to enable balanced batch sampling, 0 for original approach
 # Add this at the top of your code with other global flags
@@ -15,6 +15,7 @@ num_class=3  ##########set this to the correct number fo classes 0,1,2
 import numpy as np
 import torch
 import os
+import re
 import time
 from tqdm import tqdm
 import glob
@@ -47,32 +48,63 @@ logger = logging.get_logger(__name__)
 ipsi_contra_csv = "D:\\nature_everything\\camera_assignments.csv"
 camera_box="bboxes_ipsi"
 _map = {1: 0, 2: 1, 3: 2}##########change this for the correct mapping
+
 def load_bboxes(bbox_dir, video_id):
     """
-    Load bounding box data for a video segment.
+    Load and concatenate bounding box data across seg_0..seg_3 for a camera clip.
+
+    Expects files like:
+        <base>_seg_0_bboxes.pkl, <base>_seg_1_bboxes.pkl, <base>_seg_2_bboxes.pkl, <base>_seg_3_bboxes.pkl
+
+    Where <base> is the video id without the trailing `_seg_*`, e.g. for
+        video_id = 'patient_2_task_1_cam4_seg_3'
+    the base is
+        'patient_2_task_1_cam4'
+
+    Returns:
+        list of boxes (each length-4) concatenated in segment order (0 -> 3),
+        or None if no valid data is found.
     """
-    bbox_file = os.path.join(bbox_dir, f"{video_id}_bboxes.pkl")
-    if not os.path.exists(bbox_file):
-        logger.warning(f"No bounding box file found for {video_id} at {bbox_file}")
-        return None
+    # Derive base prefix by removing the trailing "_seg_<num>"
+    base_prefix = re.sub(r'_seg_\d+$', '', video_id)
 
-    try:
-        with open(bbox_file, 'rb') as f:
-            bboxes = pickle.load(f)
-    except Exception as e:
-        logger.error(f"Error loading bounding box file for {video_id}: {e}")
-        return None
+    all_bboxes = []
+    any_found = False
 
-    if not isinstance(bboxes, list) or not bboxes:
-        logger.error(f"Invalid bounding box data for {video_id}: expected a non-empty list, got {type(bboxes)}")
-        return None
+    for seg_idx in range(4):
+        bbox_file = os.path.join(bbox_dir, f"{base_prefix}_seg_{seg_idx}_bboxes.pkl")
+        if not os.path.exists(bbox_file):
+            logger.warning(f"No bounding box file for seg_{seg_idx} of {base_prefix} at {bbox_file}")
+            continue
 
-    for i, box in enumerate(bboxes):
-        if not isinstance(box, (list, np.ndarray)) or len(box) != 4:
-            logger.error(f"Invalid bounding box at frame {i} for {video_id}: expected 4 values, got {box}")
+        try:
+            with open(bbox_file, 'rb') as f:
+                bboxes = pickle.load(f)
+            any_found = True
+        except Exception as e:
+            logger.error(f"Error loading bounding box file for {base_prefix} seg_{seg_idx}: {e}")
             return None
 
-    return bboxes
+        # Validate the segment payload
+        if not isinstance(bboxes, list) or not bboxes:
+            logger.error(f"Invalid bounding box data for {base_prefix} seg_{seg_idx}: "
+                         f"expected a non-empty list, got {type(bboxes)}")
+            return None
+
+        for i, box in enumerate(bboxes):
+            if not isinstance(box, (list, np.ndarray)) or len(box) != 4:
+                logger.error(f"Invalid bounding box at frame {i} for {base_prefix} seg_{seg_idx}: "
+                             f"expected 4 values, got {box}")
+                return None
+
+        # Append in order (seg_0 -> seg_3)
+        all_bboxes.extend(bboxes)
+
+    if not any_found:
+        logger.warning(f"No bounding box files found for {base_prefix} across seg_0..seg_3")
+        return None
+
+    return all_bboxes
 
 
 
@@ -445,14 +477,14 @@ def visualize_gradcam_heatmaps(heatmaps, slow_frames, fast_frames, video_id, out
 # Function to perform inference and visualize Grad-CAM heatmaps
 @torch.no_grad()
 
-def perform_inference(test_loader, model, cfg, inference_segments=None):
+def perform_inference(test_loader, model, cfg, inference_tasks=None):
     """
     Perform inference on the test set and save features from different layers.
     Args:
         test_loader: DataLoader for the test set.
         model: SlowFast model.
         cfg: SlowFast configuration object.
-        inference_segments: List of segments with both therapist ratings
+        inference_tasks: List of tasks with both therapist ratings
     """
     # Define layers to extract features from
     layers_to_extract = {
@@ -498,8 +530,8 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
     
     # Create mapping from video_id to inference segment for quick lookup
     inference_map = {}
-    if inference_segments:
-        inference_map = {seg['video_id']: seg for seg in inference_segments}
+    if inference_tasks:
+        inference_map = {seg['video_id']: seg for seg in inference_tasks}
     
     # Track class predictions and their confidences
     predictions = []
@@ -520,19 +552,19 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
     batch_counts = {depth: {} for depth in layers_to_extract}
     
     # Configuration for segment processing
-    min_segments_required = 4  # Minimum segments needed to process a task
+    min_tasks_required = 4  # Minimum tasks needed to process a task
     max_wait_batches = 10      # Maximum batches to wait before flushing incomplete tasks
     
-    # Function to flush task segments to disk with improved robustness
+    # Function to flush task tasks to disk with improved robustness
     def flush_task(depth, task_key, save_dir, force=False):
         """
-        Concatenate available segments and save to disk.
+        Concatenate available tasks and save to disk.
         
         Args:
             depth: Feature depth (low, mid, deep)
             task_key: Task identifier (patient_X_task_Y_camZ)
             save_dir: Directory to save features to
-            force: Whether to force flushing even if not all segments are available
+            force: Whether to force flushing even if not all tasks are available
             
         Returns:
             Boolean indicating if the task was flushed
@@ -541,24 +573,24 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
             return False
             
         seg_dict = task_buffers[depth][task_key]
-        available_segments = set(seg_dict.keys())
+        available_tasks = set(seg_dict.keys())
         
-        # Check if all expected segments are available or if we should force flush
-        if SEG_SET.issubset(available_segments) or (force and len(available_segments) >= min_segments_required):
-            # Order the available segments
-            available_segs = sorted(available_segments)
+        # Check if all expected tasks are available or if we should force flush
+        if SEG_SET.issubset(available_tasks) or (force and len(available_tasks) >= min_tasks_required):
+            # Order the available tasks
+            available_segs = sorted(available_tasks)
             seg_order = [seg_dict[k] for k in available_segs]
             
-            # Concatenate available segments
+            # Concatenate available tasks
             task_feat = np.concatenate(seg_order, axis=1)
             
             # Save the concatenated feature
             out_path = os.path.join(save_dir, f"{task_key}_taskfeat.npy")
             np.save(out_path, task_feat.astype(np.float32))
             
-            # Log which segments were included
+            # Log which tasks were included
             seg_str = ','.join([str(s) for s in available_segs])
-            logger.info(f"[{depth}] saved {os.path.basename(out_path)} with segments {seg_str}")
+            logger.info(f"[{depth}] saved {os.path.basename(out_path)} with tasks {seg_str}")
             
             # Remove the task from buffers
             task_buffers[depth].pop(task_key)
@@ -681,7 +713,7 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
                                         # Reset batch counter when a new segment arrives
                                         batch_counts[depth][task_key] = 0
                                         
-                                        # Try to flush if all segments are available
+                                        # Try to flush if all tasks are available
                                         flush_task(depth, task_key, features_dir)
                                         
                                         logger.debug(f"Added segment {seg_id} for task {task_key} (depth: {depth})")
@@ -721,7 +753,7 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
         activation.clear()
         torch.cuda.empty_cache()
     
-    # At the end, flush any remaining tasks (with whatever segments are available)
+    # At the end, flush any remaining tasks (with whatever tasks are available)
     logger.info("Processing complete. Flushing any remaining tasks...")
     for depth in layers_to_extract:
         for task_key in list(task_buffers[depth].keys()):
@@ -871,19 +903,19 @@ def perform_inference(test_loader, model, cfg, inference_segments=None):
         segment_df.to_csv(os.path.join(cfg.OUTPUT_DIR, "segment_accuracy.csv"), index=False)
         logger.info(f"Saved segment-based accuracy report to {os.path.join(cfg.OUTPUT_DIR, 'segment_accuracy.csv')}")
         
-        # Print summary of segments with problematic accuracy
-        problem_segments = []
+        # Print summary of tasks with problematic accuracy
+        problem_tasks = []
         for row in data:
             for class_id in [0, 1, 2]:
                 if row[f'Class {class_id} Total'] > 0 and float(row[f'Class {class_id} Accuracy (%)']) < 50:
-                    problem_segments.append((row['Segment ID'], class_id, row[f'Class {class_id} Accuracy (%)']))
+                    problem_tasks.append((row['Segment ID'], class_id, row[f'Class {class_id} Accuracy (%)']))
         
-        if problem_segments:
-            logger.info("Segments with accuracy below 50%:")
-            for seg_id, class_id, accuracy in problem_segments:
+        if problem_tasks:
+            logger.info("tasks with accuracy below 50%:")
+            for seg_id, class_id, accuracy in problem_tasks:
                 logger.info(f"  Segment {seg_id}, Class {class_id}: {accuracy}%")
         else:
-            logger.info("All segments have accuracy above 50% for both classes")
+            logger.info("All tasks have accuracy above 50% for both classes")
             
     except Exception as e:
         logger.error(f"Error generating segment-based accuracy report: {e}")
@@ -913,7 +945,7 @@ def train(cfg, train_loader, val_loader, model):
     # Loss function - with or without class weighting
     if CLASS_IMBALANCE:
         # Calculate class weights (adjust based on your actual class distribution)
-        class_counts = [633, 1135]  # Your class counts from the results
+        class_counts = [194,442,157] # Your class counts from the results
         class_weights = torch.tensor([1/c for c in class_counts], device=device)
         class_weights = class_weights / class_weights.sum() * 2  # Normalize
         criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
@@ -1108,16 +1140,16 @@ def train(cfg, train_loader, val_loader, model):
 
 
 
-def create_balanced_sampler(train_segments):
+def create_balanced_sampler(train_tasks):
     """
     Create a sampler that balances classes in each batch.
     Args:
-        train_segments: List of segments with their labels
+        train_tasks: List of tasks with their labels
     Returns:
         A balanced sampler
     """
     # Extract labels for each sample
-    labels = [seg['label'] for seg in train_segments]
+    labels = [seg['label'] for seg in train_tasks]
     
     # Count samples per class
     class_count = {}
@@ -1148,8 +1180,8 @@ def get_valid_rating(segment):
     Get a valid rating only if t1 and t2 agree, or use the one that's available.
     Returns the rating if valid, or None if invalid.
     """
-    t1_rating = segment['segment_ratings'].get('t1', None)
-    t2_rating = segment['segment_ratings'].get('t2', None)
+    t1_rating = segment['task_ratings'].get('t1', None)
+    t2_rating = segment['task_ratings'].get('t2', None)
     
     # Try to convert ratings to integers
     try:
@@ -1311,24 +1343,25 @@ def test(cfg):
     logger.info(f"Found {len(pickle_files)} pickle files to process.")
     logger.info("----------------------------------------------------------")
 
-    # Collect all_segments as before...
-    all_segments = []
-    inference_segments=[]
+    # Collect all_tasks as before...
+    all_tasks = []
+    inference_tasks=[]
     r1=0
     r2=0
     no_match=0
     r3=0
-    for pkl_file in tqdm(pickle_files, desc="Collecting segments"):
+    for pkl_file in tqdm(pickle_files, desc="Collecting tasks"):
         try:
             with open(pkl_file, 'rb') as f:
                 data = pickle.load(f)
         except Exception as e:
             logger.error(f"Error loading pickle file {pkl_file}: {e}")
             continue
-
         for camera_id in data:
-            for segments_group in data[camera_id]:
-                for segment in segments_group:
+            for tasks_group in data[camera_id]:
+                frames=[]
+                frame_flag=0
+                for segment in tasks_group:
                     # Extract patient_id and camera_id from segment
                     patient_id = segment['patient_id']
                     segment_camera_id = segment['CameraId']
@@ -1340,12 +1373,12 @@ def test(cfg):
                     else:
                         continue
                     if ipsilateral_camera == segment_camera_id:
-                        if 'segment_ratings' not in segment:
-                            logger.warning(f"Skipping segment in {pkl_file} with missing 'segment_ratings'")
+                        if 'task_ratings' not in segment:
+                            logger.warning(f"Skipping segment in {pkl_file} with missing 'task_ratings'")
                             continue
                         rating = get_valid_rating(segment)
-                        t1_rating = segment['segment_ratings'].get('t1', None)
-                        t2_rating = segment['segment_ratings'].get('t2', None)
+                        t1_rating = segment['task_ratings'].get('t1', None)
+                        t2_rating = segment['task_ratings'].get('t2', None)
                         if rating is None or rating not in [1,2, 3,"no_match"]: ###########this needs to be changed to read 1,2,3
                             continue
                         else:
@@ -1353,45 +1386,47 @@ def test(cfg):
                             t2_label = None if t2_rating is None else _map.get(t2_rating)
                             video_id = (f"patient_{segment['patient_id']}_task_{segment['activity_id']}_"
                                         f"{segment['CameraId']}_seg_{segment['segment_id']}")
-                            inference_segments.append({
-                                'frames': segment['frames'],
-                                'video_id': video_id,
-                                't1_label':t1_label,
-                                't2_label':t2_label,
-                                'hand_id': ipsilateral_camera
-                                                    })                        
-
-                        try:
-                            if rating =="no_match":
-                                no_match+=1
-                                continue
-                            rating = int(rating)
-                            
-                            if rating == 1:
-                                label = 0
-                                r1 += 1
-                            elif rating == 2:
-                                label = 1
-                                r2 += 1
-                            else:
-                                label = 2
-                                r3 += 1
-                        except (ValueError, TypeError):
-                            logger.warning(f"Skipping segment in {pkl_file} with invalid rating: {rating}")
+                            frames.extend(segment['frames'])
+                            frame_flag=1
+                if frame_flag==1:
+                    try:
+                        if rating =="no_match":
+                            no_match+=1
                             continue
-                        all_segments.append({
-                            'frames': segment['frames'],
-                            'video_id': video_id,
-                            'label': label,
-                            'hand_id': ipsilateral_camera
-                        })
+                        rating = int(rating)
+                        
+                        if rating == 1:
+                            label = 0
+                            r1 += 1
+                        elif rating == 2:
+                            label = 1
+                            r2 += 1
+                        else:
+                            label = 2
+                            r3 += 1
+                    except (ValueError, TypeError):
+                        logger.warning(f"Skipping task in {pkl_file} with invalid rating: {rating}")
+                        continue
+                    all_tasks.append({
+                                'frames': frames,
+                                'video_id': video_id,
+                                'label': label,
+                                'hand_id': ipsilateral_camera
+                            })
+                    inference_tasks.append({
+                                    'frames': frames,
+                                    'video_id': video_id,
+                                    't1_label':t1_label,
+                                    't2_label':t2_label,
+                                    'hand_id': ipsilateral_camera
+                                                        })     
 
     # If we're using a pre-trained model, use all data for inference
     # Otherwise, split for training
     if USE_PRETRAINED_FINETUNED:
-        logger.info(f"Using all {len(inference_segments)} segments for inference with pre-trained model")
+        logger.info(f"Using all {len(inference_tasks)} tasks for inference with pre-trained model")
         
-        # Create dataset from inference_segments
+        # Create dataset from inference_tasks
         inference_datasets = [
             SinglePickleFrameDataset(
                 frames=seg["frames"],
@@ -1402,7 +1437,7 @@ def test(cfg):
                 bbox_dir=bbox_dir,
                 is_train=False
             )
-            for seg in inference_segments
+            for seg in inference_tasks
         ]
         
         # Create inference dataloader
@@ -1418,9 +1453,9 @@ def test(cfg):
         
         # Run inference using the pre-trained model
         logger.info("Starting inference process...")
-        perform_inference(inference_loader, model, cfg, inference_segments)
+        perform_inference(inference_loader, model, cfg, inference_tasks)
     else:
-        # Implement 5-fold cross-validation using all_segments
+        # Implement 5-fold cross-validation using all_tasks
         from sklearn.model_selection import KFold
         
         # Set up 5-fold cross-validation
@@ -1434,21 +1469,21 @@ def test(cfg):
         fold_results = []
         
         # Create a mapping from video_id to segment
-        segment_map = {seg['video_id']: seg for seg in all_segments}
+        segment_map = {seg['video_id']: seg for seg in all_tasks}
         
         # Loop through each fold
-        for fold, (train_idx, val_idx) in enumerate(kf.split(all_segments)):
+        for fold, (train_idx, val_idx) in enumerate(kf.split(all_tasks)):
             logger.info(f"Starting fold {fold+1}/{k_folds}")
             
             # Split the data for this fold - use indices to avoid data leakage
-            train_segments = [all_segments[i] for i in train_idx]
-            val_segments = [all_segments[i] for i in val_idx]
+            train_tasks = [all_tasks[i] for i in train_idx]
+            val_tasks = [all_tasks[i] for i in val_idx]
             
             # Calculate split percentages
-            train_pct = len(train_segments) / len(all_segments) * 100
-            val_pct = len(val_segments) / len(all_segments) * 100
-            logger.info(f"Fold {fold+1} split: {len(train_segments)} ({train_pct:.1f}%) train, "
-                        f"{len(val_segments)} ({val_pct:.1f}%) validation")
+            train_pct = len(train_tasks) / len(all_tasks) * 100
+            val_pct = len(val_tasks) / len(all_tasks) * 100
+            logger.info(f"Fold {fold+1} split: {len(train_tasks)} ({train_pct:.1f}%) train, "
+                        f"{len(val_tasks)} ({val_pct:.1f}%) validation")
             
             # Create datasets for this fold
             train_datasets = [
@@ -1461,7 +1496,7 @@ def test(cfg):
                     bbox_dir=bbox_dir,
                     is_train=True
                 )
-                for seg in train_segments
+                for seg in train_tasks
             ]
             
             val_datasets = [
@@ -1474,12 +1509,12 @@ def test(cfg):
                     bbox_dir=bbox_dir,
                     is_train=False
                 )
-                for seg in val_segments
+                for seg in val_tasks
             ]
             
             # Create dataloaders
             if BALANCED_SAMPLING:
-                train_sampler = create_balanced_sampler(train_segments)
+                train_sampler = create_balanced_sampler(train_tasks)
                 train_loader = torch.utils.data.DataLoader(
                     torch.utils.data.ConcatDataset(train_datasets),
                     batch_size=4,
@@ -1566,7 +1601,7 @@ def test(cfg):
         logger.info(f"Mean accuracy across folds: {mean_acc:.4f} ± {std_acc:.4f}")
         logger.info(f"Best fold: {best_fold} with accuracy {best_val_acc:.4f}")
         
-        # Final evaluation using best model on all inference_segments
+        # Final evaluation using best model on all inference_tasks
         logger.info(f"Using best model from fold {best_fold} for final inference")
         
 
@@ -1598,7 +1633,7 @@ def test(cfg):
             logger.error(f"Error loading fine-tuned weights: {e}")
             logger.info("Falling back to the pre-trained model with modified head")
 
-        # Create dataset from inference_segments for final evaluation
+        # Create dataset from inference_tasks for final evaluation
         inference_datasets = [
             SinglePickleFrameDataset(
                 frames=seg["frames"],
@@ -1609,7 +1644,7 @@ def test(cfg):
                 bbox_dir=bbox_dir,
                 is_train=False
             )
-            for seg in inference_segments
+            for seg in inference_tasks
         ]
         
         # Create inference dataloader
@@ -1625,7 +1660,7 @@ def test(cfg):
         
         # Run final inference
         logger.info("Starting final inference with best model...")
-        perform_inference(inference_loader, model, cfg, inference_segments)
+        perform_inference(inference_loader, model, cfg, inference_tasks)
 
 def main():
     args = parse_args()
