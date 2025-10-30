@@ -71,4 +71,4 @@ DETECTION:
 NUM_GPUS: 1
 NUM_SHARDS: 1
 RNG_SEED: 0
-OUTPUT_DIR: "D:/nature_everything/slowfast_features"
+OUTPUT_DIR: "D:/nature_everything/slowfast_features_task"
