@@ -6,9 +6,9 @@
 # 1 = load saved fine-tuned model and run testing only
 USE_PRETRAINED_FINETUNED = 0  # Change this value to control the workflow
 # Add this at the top of your code with other global flags
-CLASS_IMBALANCE = 0  # Set to 1 to enable class weight balancing, 0 for original approach
+CLASS_IMBALANCE = 1  # Set to 1 to enable class weight balancing, 0 for original approach
 # Add this at the top of your code with other global flags
-BALANCED_SAMPLING = 1  # Set to 1 to enable balanced batch sampling, 0 for original approach
+BALANCED_SAMPLING = 0  # Set to 1 to enable balanced batch sampling, 0 for original approach
 # Add this at the top of your code with other global flags
 SAVE_HEATMAPS_FEATURES = 1  # Set to 1 to save heatmaps and features, 0 to ignore
 num_class=3  ##########set this to the correct number fo classes 0,1,2
@@ -30,6 +30,7 @@ import pandas as pd
 from datetime import datetime
 import torch.nn.functional as F
 from skimage.transform import resize
+from sklearn.metrics import precision_score, recall_score
 # Suppress specific warnings from torchvision
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.transforms._transforms_video")
 
@@ -1084,7 +1085,9 @@ def perform_inference(test_loader, model, cfg, inference_segments=None,export_fo
         
     return predictions
 
-def train(cfg, train_loader, val_loader, model):
+
+
+def train(cfg, train_loader, val_loader, model, fold, class_weights=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     model = modify_slowfast_head(model, num_classes=num_class, device=device)
@@ -1100,19 +1103,15 @@ def train(cfg, train_loader, val_loader, model):
 
     # Optimizer setup
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), 
-                                lr=1e-4, weight_decay=1e-5)
+                                lr=1e-4, weight_decay=1e-4)
     
-    # Loss function - with or without class weighting
-    if CLASS_IMBALANCE:
-        # Calculate class weights (adjust based on your actual class distribution)
-        class_counts = [633, 1135]  # Your class counts from the results
-        class_weights = torch.tensor([1/c for c in class_counts], device=device)
-        class_weights = class_weights / class_weights.sum() * 2  # Normalize
+    # --- UPDATED LOSS FUNCTION BLOCK ---
+    if CLASS_IMBALANCE and class_weights is not None:
+        class_weights = class_weights.to(device)
         criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
-        logger.info(f"Using weighted loss with class weights: {class_weights}")
+        logger.info(f"Using weighted loss with dynamic class weights: {class_weights.tolist()}")
     else:
-        # Standard loss
-        criterion = torch.nn.CrossEntropyLoss()
+        criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
         logger.info("Using standard loss without class weighting")
     
     # Scheduler setup
@@ -1125,67 +1124,71 @@ def train(cfg, train_loader, val_loader, model):
     # Training configuration
     num_epochs = 15
     best_val_acc = 0.0
-    patience = 5  # Early stopping patience
+    patience = 5
     patience_counter = 0
     
-    # Training history
+    # Training history - UPDATED to include P/R
     history = {
-        'train_loss': [],
-        'train_acc': [],
-        'val_loss': [],
-        'val_acc': []
+        'train_loss': [], 'train_acc': [],
+        'val_loss': [], 'val_acc': [],
+        'train_precision': [], 'train_recall': [], # Stores list of arrays per epoch
+        'val_precision': [], 'val_recall': []      # Stores list of arrays per epoch
     }
     
-    # Gradient accumulation setup for effective larger batch size
-    target_batch_size = 8  # Target effective batch size
+    target_batch_size = 8
     actual_batch_size = cfg.TRAIN.BATCH_SIZE if hasattr(cfg.TRAIN, 'BATCH_SIZE') else 4
-    
-    # Ensure we don't divide by zero
     if actual_batch_size <= 0:
-        logger.warning(f"Invalid batch size: {actual_batch_size}. Setting to 1.")
         actual_batch_size = 1
         
     accumulation_steps = max(1, target_batch_size // actual_batch_size)
-    logger.info(f"Using gradient accumulation: {accumulation_steps} steps (batch size {actual_batch_size})")
+    logger.info(f"Using gradient accumulation: {accumulation_steps} steps")
     
     for epoch in range(num_epochs):
-        # Training phase
+        # --- Training phase ---
         model.train()
         train_loss = train_correct = train_total = 0
-        optimizer.zero_grad()  # Zero gradients before epoch starts
+        train_preds, train_targets = [], [] # New: Collect train preds for P/R calculation
+        optimizer.zero_grad()
         
         for i, (inputs, video_id, _, _, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
             inputs = [inp.to(device) for inp in inputs]
             labels = labels.to(device)
             
-            # Forward pass with mixed precision
             with autocast():
                 outputs, _ = model(inputs)
-                loss = criterion(outputs, labels) / accumulation_steps  # Scale for accumulation
+                loss = criterion(outputs, labels) / accumulation_steps
                 
-            # Backward pass with gradient scaling
             scaler.scale(loss).backward()
             
-            # Update weights after accumulation_steps or at the end of epoch
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
             
-            # Track metrics (scale loss back for reporting)
+            # Metrics
             train_loss += loss.item() * accumulation_steps
             _, pred = outputs.max(1)
             train_total += labels.size(0)
             train_correct += (pred == labels).sum().item()
             
-            # Clean up memory
+            # Collect predictions for P/R
+            train_preds.extend(pred.detach().cpu().numpy())
+            train_targets.extend(labels.detach().cpu().numpy())
+            
             del inputs, outputs, labels, loss
             torch.cuda.empty_cache()
 
         train_acc = 100 * train_correct / train_total
-        logger.info(f"Epoch {epoch+1}: Train Loss {train_loss/len(train_loader):.4f}, Acc {train_acc:.2f}%")
         
-        # Validation phase
+        # Calculate Train P/R
+        # average=None returns metrics for each class in a sorted array (class 0, 1, 2...)
+        train_prec = precision_score(train_targets, train_preds, average=None, zero_division=0)
+        train_rec = recall_score(train_targets, train_preds, average=None, zero_division=0)
+        
+        logger.info(f"Epoch {epoch+1}: Train Loss {train_loss/len(train_loader):.4f}, Acc {train_acc:.2f}%")
+        logger.info(f"   Train Prec: {np.round(train_prec, 3)} | Recall: {np.round(train_rec, 3)}")
+        
+        # --- Validation phase ---
         model.eval()
         val_loss = val_correct = val_total = 0
         val_preds, val_targets = [], []
@@ -1203,25 +1206,33 @@ def train(cfg, train_loader, val_loader, model):
                 val_total += labels.size(0)
                 val_correct += (predicted == labels).sum().item()
                 
-                # Save predictions for analysis
                 val_preds.extend(predicted.cpu().numpy())
                 val_targets.extend(labels.cpu().numpy())
                 
-                # Clean up memory
                 del inputs, outputs, labels
                 torch.cuda.empty_cache()
         
         val_acc = 100 * val_correct / val_total
-        logger.info(f"Epoch {epoch+1}/{num_epochs}, Val Loss: {val_loss/len(val_loader):.4f}, Val Acc: {val_acc:.2f}%")
         
-        # Update scheduler based on validation accuracy
+        # Calculate Val P/R
+        val_prec = precision_score(val_targets, val_preds, average=None, zero_division=0)
+        val_rec = recall_score(val_targets, val_preds, average=None, zero_division=0)
+        
+        logger.info(f"Epoch {epoch+1}/{num_epochs}, Val Loss: {val_loss/len(val_loader):.4f}, Val Acc: {val_acc:.2f}%")
+        logger.info(f"   Val Prec:   {np.round(val_prec, 3)} | Recall: {np.round(val_rec, 3)}")
+        
         scheduler.step(val_acc)
         
-        # Track history
+        # Update history
         history['train_loss'].append(train_loss/len(train_loader))
         history['train_acc'].append(train_acc)
+        history['train_precision'].append(train_prec)
+        history['train_recall'].append(train_rec)
+        
         history['val_loss'].append(val_loss/len(val_loader))
         history['val_acc'].append(val_acc)
+        history['val_precision'].append(val_prec)
+        history['val_recall'].append(val_rec)
         
         # Save best model
         if val_acc > best_val_acc:
@@ -1234,25 +1245,20 @@ def train(cfg, train_loader, val_loader, model):
                 'best_val_acc': best_val_acc,
                 'scaler': scaler.state_dict()
             }, os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_best.pt"))
-            logger.info(f"New best model saved with validation accuracy: {val_acc:.2f}%")
+            logger.info(f"New best model saved.")
             patience_counter = 0
         else:
             patience_counter += 1
             
-        # Early stopping check
         if patience_counter >= patience:
             logger.info(f"Early stopping triggered after {epoch+1} epochs")
             break
             
-        # Save checkpoint
-        if (epoch + 1) % 2 == 0:  # Save every 2 epochs
+        if (epoch + 1) % 2 == 0:
             torch.save({
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'best_val_acc': best_val_acc,
-                'scaler': scaler.state_dict(),
                 'history': history
             }, os.path.join(cfg.OUTPUT_DIR, f"slowfast_checkpoint_epoch{epoch+1}.pt"))
     
@@ -1260,32 +1266,26 @@ def train(cfg, train_loader, val_loader, model):
     torch.save({
         'epoch': epoch + 1,
         'state_dict': model.state_dict(),
-        'optimizer': optimizer.state_dict(),
         'best_val_acc': best_val_acc,
         'history': history
     }, os.path.join(cfg.OUTPUT_DIR, "slowfast_finetuned_final.pt"))
     
-    # Plot and save training history
+    # Plotting (Updated for Accuracy only, but History contains everything)
     plt.figure(figsize=(12, 5))
-    
     plt.subplot(1, 2, 1)
     plt.plot(history['train_loss'], label='Train Loss')
     plt.plot(history['val_loss'], label='Val Loss')
     plt.title('Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
     plt.legend()
     
     plt.subplot(1, 2, 2)
-    plt.plot(history['train_acc'], label='Train Accuracy')
-    plt.plot(history['val_acc'], label='Val Accuracy')
+    plt.plot(history['train_acc'], label='Train Acc')
+    plt.plot(history['val_acc'], label='Val Acc')
     plt.title('Accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy (%)')
     plt.legend()
     
     plt.tight_layout()
-    plt.savefig(os.path.join(cfg.OUTPUT_DIR, "training_history.png"))
+    plt.savefig(os.path.join(cfg.OUTPUT_DIR, "training_history_"+str(fold)+".png"))
     plt.close()
     
     # Load best model for return
@@ -1421,6 +1421,21 @@ def perform_inference_fold(val_loader, model, fold_num):
         'class_metrics': class_metrics,
         'predictions': predictions
     }    
+
+import re
+
+def get_patient_id_from_video_id(video_id: str):
+    """
+    Extract patient id from strings like:
+      patient_12_task_7_cam3_seg_4
+    Returns int if possible, else string id.
+    """
+    m = re.search(r"patient_([^_]+)", video_id)
+    if not m:
+        return None
+    pid = m.group(1)
+    return int(pid) if pid.isdigit() else pid
+
 def test(cfg):
     """
     Main function to fine-tune the SlowFast model and perform inference.
@@ -1612,12 +1627,20 @@ def test(cfg):
         logger.info("Starting inference process...")
         perform_inference(inference_loader, model, cfg, inference_segments)
     else:
-        # Implement 5-fold cross-validation using all_segments
-        from sklearn.model_selection import KFold
-        
-        # Set up 5-fold cross-validation
+        # # Implement 5-fold cross-validation using all_segments
+        # from sklearn.model_selection import KFold
+        #kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
         k_folds = 5
-        kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+        groups = []
+        bad = 0
+        for seg in all_segments:
+            pid = get_patient_id_from_video_id(seg["video_id"])
+            if pid is None:
+                bad += 1
+                pid = f"unknown_{bad}"  # keep split running, but you should inspect these
+            groups.append(pid)
+
+        groups = np.asarray(groups)      
         
         # Track best model across folds
         best_val_acc = 0.0
@@ -1626,16 +1649,47 @@ def test(cfg):
         fold_results = []
         
         # Create a mapping from video_id to segment
-        segment_map = {seg['video_id']: seg for seg in all_segments}
-        
-        # Loop through each fold
-        for fold, (train_idx, val_idx) in enumerate(kf.split(all_segments)):
+        segment_map = {seg['video_id']: seg for seg in all_segments}       
+        from sklearn.model_selection import StratifiedGroupKFold
+        # 'y_labels' ensures class stratification
+        groups = [get_patient_id_from_video_id(s["video_id"]) for s in all_segments]
+        y_labels = [s['label'] for s in all_segments]
+
+        # 2. Use StratifiedGroupKFold instead of GroupKFold
+        sgkf = StratifiedGroupKFold(n_splits=k_folds, shuffle=True, random_state=42)
+
+        # 3. Pass 'y=y_labels' and 'groups=groups' to the split function
+        for fold, (train_idx, val_idx) in enumerate(sgkf.split(all_segments, y=y_labels, groups=groups)):
             logger.info(f"Starting fold {fold+1}/{k_folds}")
-            
-            # Split the data for this fold - use indices to avoid data leakage
+
             train_segments = [all_segments[i] for i in train_idx]
-            val_segments = [all_segments[i] for i in val_idx]
+            val_segments   = [all_segments[i] for i in val_idx]
+
+            # sanity check: no patient overlap
+            train_p = {get_patient_id_from_video_id(s["video_id"]) for s in train_segments}
+            val_p   = {get_patient_id_from_video_id(s["video_id"]) for s in val_segments}
+            overlap = train_p.intersection(val_p)
+            logger.info(f"Fold {fold+1}: patient overlap = {len(overlap)}")
             
+            # Sanity check: Check label distribution in this fold
+            train_lbls = [s['label'] for s in train_segments]
+            val_lbls = [s['label'] for s in val_segments]
+            logger.info(f"Fold {fold+1} Train distribution: {np.bincount(train_lbls, minlength=3)}")
+            logger.info(f"Fold {fold+1} Val distribution:   {np.bincount(val_lbls, minlength=3)}")
+            # --- NEW: Calculate Class Weights Dynamically (Keep this logic) ---
+            weights_tensor = None
+            if CLASS_IMBALANCE:
+                # 1. Extract all labels from the current training split
+                train_labels = [seg['label'] for seg in train_segments]               
+                # 2. Count frequencies
+                class_counts = np.bincount(train_labels, minlength=3)
+                total_samples = len(train_labels)
+                num_classes = 3               
+                logger.info(f"Fold {fold+1} Class Counts: {class_counts}")
+                # 3. Compute 'balanced' weights: N / (num_classes * count_i)
+                weights = total_samples / (num_classes * (class_counts + 1e-6))
+                # 4. Convert to tensor
+                weights_tensor = torch.tensor(weights, dtype=torch.float)           
             # Calculate split percentages
             train_pct = len(train_segments) / len(all_segments) * 100
             val_pct = len(val_segments) / len(all_segments) * 100
@@ -1710,8 +1764,9 @@ def test(cfg):
             
             # Train the model for this fold
             logger.info(f"Training model for fold {fold+1}")
-            fold_model = train(cfg, train_loader, val_loader, fold_model)
-            
+            #fold_model = train(cfg, train_loader, val_loader, fold_model)
+            # UPDATE THIS CALL:
+            fold_model = train(cfg, train_loader, val_loader, fold_model, fold,class_weights=weights_tensor)
             # Save fold model
             fold_dir = os.path.join(cfg.OUTPUT_DIR, f"fold_{fold+1}")
             os.makedirs(fold_dir, exist_ok=True)
